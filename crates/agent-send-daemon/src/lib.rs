@@ -16,6 +16,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub mod transfer;
+
+pub use transfer::{
+    Cancellation, LoopbackTransport, TransferEngine, TransferError, TransferOutcome,
+    TransferProgress, CHUNK_SIZE,
+};
+
 pub const API_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -202,6 +209,7 @@ pub struct Daemon {
     config: Config,
     identity: LocalIdentity,
     registry: PeerRegistry,
+    transfer: transfer::TransferEngine,
 }
 
 impl Daemon {
@@ -213,6 +221,7 @@ impl Daemon {
             config,
             identity,
             registry,
+            transfer: transfer::TransferEngine::new(),
         })
     }
 
@@ -252,6 +261,45 @@ impl Daemon {
 
     pub fn identity(&self) -> &LocalIdentity {
         &self.identity
+    }
+
+    /// Register a named capability used by the transfer API. The engine never
+    /// accepts an unscoped filesystem path.
+    pub fn add_shared_folder(
+        &self,
+        id: impl Into<String>,
+        root: impl Into<PathBuf>,
+        direction: agent_send_core::FolderDirection,
+    ) {
+        self.transfer.add_folder(
+            id,
+            agent_send_core::path_policy::PathPolicy::new(root, direction),
+        );
+    }
+
+    pub fn transfer_engine(&self) -> &transfer::TransferEngine {
+        &self.transfer
+    }
+
+    /// Version-independent local client entry point for the current loopback
+    /// transport. Network transports can implement the same manifest/chunk seam.
+    pub fn send_to<F>(
+        &self,
+        receiver: &Daemon,
+        request: &agent_send_core::TransferRequest,
+        cancel: &Cancellation,
+        progress: F,
+    ) -> Result<TransferOutcome, TransferError>
+    where
+        F: FnMut(TransferProgress),
+    {
+        LoopbackTransport::send(
+            &self.transfer,
+            &receiver.transfer,
+            request,
+            cancel,
+            progress,
+        )
     }
 
     pub fn start(self) -> Result<RunningDaemon, DaemonError> {

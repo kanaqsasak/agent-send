@@ -34,6 +34,8 @@ pub struct Peer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferRequest {
     pub peer_id: String,
+    /// Named readable capability on the sending daemon.
+    pub source_folder_id: String,
     pub source_paths: Vec<String>,
     pub destination_folder_id: String,
     pub idempotency_key: String,
@@ -72,6 +74,7 @@ mod tests {
     fn request() -> TransferRequest {
         TransferRequest {
             peer_id: "peer-1".into(),
+            source_folder_id: "documents".into(),
             source_paths: vec!["report.pdf".into()],
             destination_folder_id: "shared".into(),
             idempotency_key: "job-1".into(),

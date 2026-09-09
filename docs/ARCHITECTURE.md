@@ -57,7 +57,7 @@ The MCP adapter should be a separate process or thin adapter over this API. It s
 
 ## Protocol direction
 
-Begin with a versioned HTTP/JSON control protocol and streamed file bodies, compatible with LocalSend-style LAN deployment. Keep transport behind a trait so QUIC can be benchmarked without changing policy or UI. Transfers should support size/hash metadata, cancellation, progress, and resume tokens.
+Begin with a versioned HTTP/JSON control protocol and streamed file bodies, compatible with LocalSend-style LAN deployment. Keep transport behind a trait so QUIC can be benchmarked without changing policy or UI. Transfers should support size/hash metadata, cancellation, progress, and resume tokens. The M3 loopback seam models this as a versioned request plus bounded (64 KiB) file chunks; `TransferEngine` owns capability checks and filesystem writes, while `LoopbackTransport` is replaceable by HTTP/QUIC. Idempotency keys are recorded by the receiving engine, and files are written to a temporary sibling before an atomic rename.
 
 Peer advertisements currently enter a deterministic in-process registry; the local API and trust persistence do not depend on a network discovery implementation. The future mDNS/Bonjour adapter should implement that seam and submit advertisements only (discovery metadata is never trust). This milestone intentionally does not open mDNS sockets, which keeps local tests deterministic and leaves firewall/Wi-Fi-isolation behavior for the adapter integration.
 

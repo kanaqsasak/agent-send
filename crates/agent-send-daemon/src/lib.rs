@@ -16,8 +16,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub mod discovery;
+pub mod peer_transport;
 pub mod transfer;
 
+pub use discovery::{
+    DiscoveryError, MdnsDiscovery, MockPeerDiscovery, PeerDiscovery, MDNS_SERVICE_TYPE,
+};
+pub use peer_transport::{
+    EncryptedPeerFrame, MockPeerTransport, PairedPeer, PairingSecret, PeerChannelError,
+    PeerConnection, PeerConnectionError, PeerMessage, PeerTransport, PeerTransportError,
+    SecurePeerChannel, PEER_PROTOCOL_VERSION,
+};
 pub use transfer::{
     Cancellation, LoopbackTransport, TransferEngine, TransferError, TransferOutcome,
     TransferProgress, CHUNK_SIZE,
@@ -201,6 +211,12 @@ pub enum DaemonError {
     PeerStorage(#[source] io::Error),
     #[error("failed to start local API: {0}")]
     Bind(#[source] io::Error),
+    #[error(transparent)]
+    Discovery(#[from] DiscoveryError),
+    #[error("peer is not trusted: {0}")]
+    UntrustedPeer(String),
+    #[error(transparent)]
+    PeerChannel(#[from] PeerChannelError),
     #[error("daemon thread failed to stop")]
     Shutdown,
 }
@@ -231,6 +247,45 @@ impl Daemon {
 
     pub fn advertise_peer(&mut self, advertisement: PeerAdvertisement) {
         self.registry.advertise(advertisement);
+    }
+
+    /// Publish local LAN presence through a discovery adapter. Advertisements
+    /// contain no trust decision or pairing secret.
+    pub fn publish_presence<D: PeerDiscovery>(
+        &self,
+        discovery: &mut D,
+        advertisement: &PeerAdvertisement,
+    ) -> Result<(), DaemonError> {
+        discovery.publish(advertisement)?;
+        Ok(())
+    }
+
+    /// Pull untrusted LAN advertisements into the ephemeral registry.
+    pub fn discover_peers<D: PeerDiscovery>(
+        &mut self,
+        discovery: &mut D,
+    ) -> Result<usize, DaemonError> {
+        let advertisements = discovery.discover()?;
+        let count = advertisements.len();
+        for advertisement in advertisements {
+            self.registry.advertise(advertisement);
+        }
+        Ok(count)
+    }
+
+    /// Construct a cryptographic channel only after the existing pairing/trust
+    /// registry authorizes the peer ID. Pairing secrets remain outside DNS-SD
+    /// and must come from the human-confirmed pairing protocol.
+    pub fn secure_peer_channel(&self, peer: PairedPeer) -> Result<SecurePeerChannel, DaemonError> {
+        if !self
+            .registry
+            .peers
+            .get(peer.id())
+            .is_some_and(|record| record.trusted)
+        {
+            return Err(DaemonError::UntrustedPeer(peer.id().to_owned()));
+        }
+        Ok(SecurePeerChannel::new(self.identity.id.clone(), peer)?)
     }
 
     pub fn request_pairing(&mut self, advertisement: PeerAdvertisement) -> PairingResponse {
@@ -388,13 +443,30 @@ fn handle_connection(
     registry: &Arc<Mutex<PeerRegistry>>,
     persist_path: &Path,
 ) {
+    // TCP does not preserve HTTP request boundaries. Read complete headers and
+    // any declared body before responding so a segmented local request is not
+    // misparsed or closed with unread client data.
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    // Accepted sockets inherit the nonblocking setting of the listener on
+    // supported platforms; local request reads need a bounded blocking mode.
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
     let mut request = Vec::new();
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let mut buffer = [0; 8192];
-    let Ok(size) = stream.read(&mut buffer) else {
-        return;
-    };
-    request.extend_from_slice(&buffer[..size]);
+    while request.len() < MAX_REQUEST_BYTES {
+        let Ok(size) = stream.read(&mut buffer) else {
+            return;
+        };
+        if size == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..size]);
+        if request_is_complete(&request) {
+            break;
+        }
+    }
     let text = String::from_utf8_lossy(&request);
     let mut parts = text.splitn(2, "\r\n\r\n");
     let head = parts.next().unwrap_or_default();
@@ -470,6 +542,22 @@ fn handle_connection(
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
+}
+
+fn request_is_complete(request: &[u8]) -> bool {
+    let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = head
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("Content-Length:")
+                .or_else(|| line.strip_prefix("content-length:"))
+        })
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    request.len() >= header_end + 4 + content_length
 }
 
 fn load_or_create_identity(path: &Path) -> Result<LocalIdentity, DaemonError> {
@@ -608,7 +696,7 @@ mod tests {
             .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
-        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.starts_with("HTTP/1.1 200 OK"), "{response}");
         assert!(response.contains("\"version\":1"));
         assert!(response.contains("\"status\":\"ok\""));
         running.shutdown().unwrap();
@@ -622,6 +710,35 @@ mod tests {
             address: "127.0.0.1:9000".into(),
             api_version: API_VERSION,
         }
+    }
+
+    #[test]
+    fn discovery_is_untrusted_until_pairing_authorizes_a_secure_peer_channel() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-network-trust",
+            std::process::id()
+        ));
+        let mut daemon = Daemon::new(config(&path)).unwrap();
+        let remote = advertisement("peer-network");
+        let mut discovery = MockPeerDiscovery::default();
+        daemon.publish_presence(&mut discovery, &remote).unwrap();
+        discovery.inject(remote.clone());
+        assert_eq!(daemon.discover_peers(&mut discovery).unwrap(), 1);
+        assert!(!daemon.peers()[0].trusted);
+
+        let paired = PairedPeer::new("peer-network", PairingSecret::new([3; 32])).unwrap();
+        assert!(matches!(
+            daemon.secure_peer_channel(paired.clone()),
+            Err(DaemonError::UntrustedPeer(_))
+        ));
+        let pairing = daemon.request_pairing(remote);
+        assert!(daemon
+            .confirm_pairing("peer-network", &pairing.code)
+            .unwrap());
+        assert!(daemon.secure_peer_channel(paired).is_ok());
+
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(trusted_peers_path(&path));
     }
 
     #[test]

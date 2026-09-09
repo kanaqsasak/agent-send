@@ -27,7 +27,7 @@ humans, while exposing a safe local API/CLI/MCP surface for AI agents.
 
 - [x] Repository, Rust workspace, core shared types, and baseline tests.
 - [x] Initial architecture and security boundary documentation.
-- [ ] Add contribution instructions and CI.
+- [x] Add contribution instructions and CI.
 
 ### M1 — Daemon skeleton
 

@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/agent-send-core"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+version = "0.1.0"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+strip = true

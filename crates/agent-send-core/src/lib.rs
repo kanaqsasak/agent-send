@@ -3,6 +3,8 @@
 //! Networking and OS integration belong in the daemon. Keeping these types
 //! small makes the desktop, CLI, and agent adapters use the same contract.
 
+pub mod path_policy;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 

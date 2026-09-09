@@ -34,6 +34,13 @@ Prerequisites: Rust stable, Node.js, and the platform dependencies required by T
 cargo test --workspace
 ```
 
+Build and run the deterministic local transfer demo:
+
+```sh
+cargo build -p agent-send-cli
+cargo run -p agent-send-cli -- demo
+```
+
 The desktop app will be added after the core protocol and security boundaries are validated.
 
 ## Planned clients

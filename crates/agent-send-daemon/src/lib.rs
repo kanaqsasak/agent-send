@@ -5,11 +5,13 @@
 //! state or configuration.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -60,6 +62,113 @@ pub struct LocalIdentity {
     pub key_placeholder: String,
 }
 
+/// Metadata advertised by a peer. Discovery is deliberately transport-neutral;
+/// an mDNS adapter can feed these records into the registry later.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerAdvertisement {
+    pub id: String,
+    pub alias: String,
+    pub address: String,
+    pub api_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerRecord {
+    pub advertisement: PeerAdvertisement,
+    pub trusted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairingResponse {
+    pub peer_id: String,
+    pub code: String,
+    pub expires_in_seconds: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeersResponse {
+    pub version: u32,
+    pub peers: Vec<PeerRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfirmPairing {
+    peer_id: String,
+    code: String,
+}
+
+/// Deterministic in-memory registry. Persistence is performed after trust
+/// changes, while advertisements themselves remain ephemeral.
+#[derive(Debug, Default)]
+pub struct PeerRegistry {
+    peers: BTreeMap<String, PeerRecord>,
+    pending: BTreeMap<String, String>,
+    next_code: u64,
+}
+
+impl PeerRegistry {
+    pub fn list(&self) -> Vec<PeerRecord> {
+        self.peers.values().cloned().collect()
+    }
+
+    pub fn advertise(&mut self, advertisement: PeerAdvertisement) {
+        let id = advertisement.id.clone();
+        let trusted = self.peers.get(&id).is_some_and(|peer| peer.trusted);
+        self.peers.insert(
+            id,
+            PeerRecord {
+                advertisement,
+                trusted,
+            },
+        );
+    }
+
+    pub fn request_pairing(&mut self, advertisement: PeerAdvertisement) -> PairingResponse {
+        let id = advertisement.id.clone();
+        self.advertise(advertisement);
+        self.next_code = self.next_code.wrapping_add(1);
+        // A short, visible code; no network randomness is required for this
+        // foundation, and the monotonic seed makes local tests reproducible.
+        let code = format!("{:06}", self.next_code % 1_000_000);
+        self.pending.insert(id.clone(), code.clone());
+        PairingResponse {
+            peer_id: id,
+            code,
+            expires_in_seconds: 300,
+        }
+    }
+
+    pub fn confirm_pairing(&mut self, peer_id: &str, code: &str) -> bool {
+        if self.pending.get(peer_id).map(String::as_str) != Some(code) {
+            return false;
+        }
+        self.pending.remove(peer_id);
+        if let Some(peer) = self.peers.get_mut(peer_id) {
+            peer.trusted = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn revoke(&mut self, peer_id: &str) -> bool {
+        self.pending.remove(peer_id);
+        self.peers
+            .get_mut(peer_id)
+            .map(|peer| {
+                peer.trusted = false;
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    fn restore_trusted(&mut self, records: Vec<PeerRecord>) {
+        for record in records {
+            self.peers.insert(record.advertisement.id.clone(), record);
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HealthResponse {
     pub version: u32,
@@ -81,6 +190,8 @@ pub enum DaemonError {
     MissingIdentityPath,
     #[error("identity storage failed: {0}")]
     Identity(#[source] io::Error),
+    #[error("peer storage failed: {0}")]
+    PeerStorage(#[source] io::Error),
     #[error("failed to start local API: {0}")]
     Bind(#[source] io::Error),
     #[error("daemon thread failed to stop")]
@@ -90,13 +201,53 @@ pub enum DaemonError {
 pub struct Daemon {
     config: Config,
     identity: LocalIdentity,
+    registry: PeerRegistry,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self, DaemonError> {
         config.validate()?;
         let identity = load_or_create_identity(&config.identity_path)?;
-        Ok(Self { config, identity })
+        let registry = load_trusted_peers(&trusted_peers_path(&config.identity_path))?;
+        Ok(Self {
+            config,
+            identity,
+            registry,
+        })
+    }
+
+    pub fn peers(&self) -> Vec<PeerRecord> {
+        self.registry.list()
+    }
+
+    pub fn advertise_peer(&mut self, advertisement: PeerAdvertisement) {
+        self.registry.advertise(advertisement);
+    }
+
+    pub fn request_pairing(&mut self, advertisement: PeerAdvertisement) -> PairingResponse {
+        self.registry.request_pairing(advertisement)
+    }
+
+    pub fn confirm_pairing(&mut self, peer_id: &str, code: &str) -> Result<bool, DaemonError> {
+        let confirmed = self.registry.confirm_pairing(peer_id, code);
+        if confirmed {
+            save_trusted_peers(
+                &trusted_peers_path(&self.config.identity_path),
+                &self.registry,
+            )?;
+        }
+        Ok(confirmed)
+    }
+
+    pub fn revoke_peer(&mut self, peer_id: &str) -> Result<bool, DaemonError> {
+        let revoked = self.registry.revoke(peer_id);
+        if revoked {
+            save_trusted_peers(
+                &trusted_peers_path(&self.config.identity_path),
+                &self.registry,
+            )?;
+        }
+        Ok(revoked)
     }
 
     pub fn identity(&self) -> &LocalIdentity {
@@ -108,11 +259,13 @@ impl Daemon {
         listener.set_nonblocking(true).map_err(DaemonError::Bind)?;
         let local_addr = listener.local_addr().map_err(DaemonError::Bind)?;
         let identity = self.identity;
+        let registry = Arc::new(Mutex::new(self.registry));
+        let persist_path = trusted_peers_path(&self.config.identity_path);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
         let thread = thread::Builder::new()
-            .name("agent-send-health".into())
-            .spawn(move || run_server(listener, identity, shutdown_rx))
+            .name("agent-send-local-api".into())
+            .spawn(move || run_server(listener, identity, registry, persist_path, shutdown_rx))
             .map_err(DaemonError::Bind)?;
 
         Ok(RunningDaemon {
@@ -160,13 +313,19 @@ impl Drop for RunningDaemon {
     }
 }
 
-fn run_server(listener: TcpListener, identity: LocalIdentity, shutdown: mpsc::Receiver<()>) {
+fn run_server(
+    listener: TcpListener,
+    identity: LocalIdentity,
+    registry: Arc<Mutex<PeerRegistry>>,
+    persist_path: PathBuf,
+    shutdown: mpsc::Receiver<()>,
+) {
     loop {
         if shutdown.try_recv().is_ok() {
             return;
         }
         match listener.accept() {
-            Ok((stream, _)) => handle_connection(stream, &identity),
+            Ok((stream, _)) => handle_connection(stream, &identity, &registry, &persist_path),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -175,27 +334,88 @@ fn run_server(listener: TcpListener, identity: LocalIdentity, shutdown: mpsc::Re
     }
 }
 
-fn handle_connection(mut stream: TcpStream, identity: &LocalIdentity) {
-    let mut request = [0; 1024];
-    let Ok(size) = stream.read(&mut request) else {
+fn handle_connection(
+    mut stream: TcpStream,
+    identity: &LocalIdentity,
+    registry: &Arc<Mutex<PeerRegistry>>,
+    persist_path: &Path,
+) {
+    let mut request = Vec::new();
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+    let mut buffer = [0; 8192];
+    let Ok(size) = stream.read(&mut buffer) else {
         return;
     };
-    let request = String::from_utf8_lossy(&request[..size]);
-    let first_line = request.lines().next().unwrap_or_default();
-    let (status, body) =
-        if first_line == "GET /v1/health HTTP/1.1" || first_line == "GET /v1/health HTTP/1.0" {
-            let response = HealthResponse {
+    request.extend_from_slice(&buffer[..size]);
+    let text = String::from_utf8_lossy(&request);
+    let mut parts = text.splitn(2, "\r\n\r\n");
+    let head = parts.next().unwrap_or_default();
+    let body = parts.next().unwrap_or_default();
+    let first_line = head.lines().next().unwrap_or_default();
+    let method_path = first_line.split_whitespace().take(2).collect::<Vec<_>>();
+    let (status, body) = match (method_path.first().copied(), method_path.get(1).copied()) {
+        (Some("GET"), Some("/v1/health")) => (
+            "200 OK",
+            serde_json::to_string(&HealthResponse {
                 version: API_VERSION,
                 status: HealthStatus::Ok,
                 identity_id: identity.id.clone(),
-            };
+            })
+            .unwrap(),
+        ),
+        (Some("GET"), Some("/v1/peers")) => {
+            let peers = registry.lock().unwrap().list();
             (
                 "200 OK",
-                serde_json::to_string(&response).expect("health response is serializable"),
+                serde_json::to_string(&PeersResponse {
+                    version: API_VERSION,
+                    peers,
+                })
+                .unwrap(),
             )
-        } else {
-            ("404 Not Found", "{\"error\":\"not_found\"}".to_owned())
-        };
+        }
+        (Some("POST"), Some("/v1/pairings")) | (Some("POST"), Some("/v1/pairing")) => {
+            match serde_json::from_str::<PeerAdvertisement>(body) {
+                Ok(ad) => {
+                    let response = registry.lock().unwrap().request_pairing(ad);
+                    ("200 OK", serde_json::to_string(&response).unwrap())
+                }
+                Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
+            }
+        }
+        (Some("POST"), Some("/v1/pairings/confirm"))
+        | (Some("POST"), Some("/v1/pairing/confirm")) => {
+            match serde_json::from_str::<ConfirmPairing>(body) {
+                Ok(request) => {
+                    let mut peers = registry.lock().unwrap();
+                    let confirmed = peers.confirm_pairing(&request.peer_id, &request.code);
+                    if confirmed {
+                        let _ = save_trusted_peers(persist_path, &peers);
+                    }
+                    if confirmed {
+                        ("200 OK", "{\"confirmed\":true}".into())
+                    } else {
+                        ("400 Bad Request", "{\"confirmed\":false}".into())
+                    }
+                }
+                Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
+            }
+        }
+        (Some("DELETE"), Some(path)) if path.starts_with("/v1/peers/") => {
+            let id = &path["/v1/peers/".len()..];
+            let mut peers = registry.lock().unwrap();
+            let revoked = peers.revoke(id);
+            if revoked {
+                let _ = save_trusted_peers(persist_path, &peers);
+            }
+            if revoked {
+                ("200 OK", "{\"revoked\":true}".into())
+            } else {
+                ("404 Not Found", "{\"error\":\"peer_not_found\"}".into())
+            }
+        }
+        _ => ("404 Not Found", "{\"error\":\"not_found\"}".to_owned()),
+    };
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -240,6 +460,45 @@ fn new_identity() -> LocalIdentity {
         id: format!("device-{}", &value[..16]),
         key_placeholder: value,
     }
+}
+
+fn trusted_peers_path(identity_path: &Path) -> PathBuf {
+    identity_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("trusted-peers.json")
+}
+
+fn load_trusted_peers(path: &Path) -> Result<PeerRegistry, DaemonError> {
+    let mut registry = PeerRegistry::default();
+    match fs::read_to_string(path) {
+        Ok(contents) => {
+            let records = serde_json::from_str::<Vec<PeerRecord>>(&contents).map_err(|error| {
+                DaemonError::PeerStorage(io::Error::new(io::ErrorKind::InvalidData, error))
+            })?;
+            registry.restore_trusted(records);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(DaemonError::PeerStorage(error)),
+    }
+    Ok(registry)
+}
+
+fn save_trusted_peers(path: &Path, registry: &PeerRegistry) -> Result<(), DaemonError> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).map_err(DaemonError::PeerStorage)?;
+    }
+    let records: Vec<_> = registry
+        .peers
+        .values()
+        .filter(|peer| peer.trusted)
+        .cloned()
+        .collect();
+    let contents = serde_json::to_vec_pretty(&records).expect("peer records are serializable");
+    fs::write(path, contents).map_err(DaemonError::PeerStorage)
 }
 
 fn default_identity_path() -> PathBuf {
@@ -299,5 +558,54 @@ mod tests {
         assert!(response.contains("\"status\":\"ok\""));
         running.shutdown().unwrap();
         fs::remove_file(path).unwrap();
+    }
+
+    fn advertisement(id: &str) -> PeerAdvertisement {
+        PeerAdvertisement {
+            id: id.into(),
+            alias: format!("Peer {id}"),
+            address: "127.0.0.1:9000".into(),
+            api_version: API_VERSION,
+        }
+    }
+
+    #[test]
+    fn pairing_rejects_wrong_code_and_persists_then_revokes_trust() {
+        let path =
+            std::env::temp_dir().join(format!("agent-send-test-{}-pairing", std::process::id()));
+        let mut daemon = Daemon::new(config(&path)).unwrap();
+        let pairing = daemon.request_pairing(advertisement("peer-a"));
+        assert!(!daemon.confirm_pairing("peer-a", "000000").unwrap());
+        assert!(daemon.confirm_pairing("peer-a", &pairing.code).unwrap());
+        assert_eq!(daemon.peers()[0].advertisement.id, "peer-a");
+        let daemon = Daemon::new(config(&path)).unwrap();
+        assert!(daemon.peers()[0].trusted);
+        let mut daemon = daemon;
+        assert!(daemon.revoke_peer("peer-a").unwrap());
+        assert!(Daemon::new(config(&path)).unwrap().peers().is_empty());
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(trusted_peers_path(
+            &std::env::temp_dir().join(format!("agent-send-test-{}-pairing", std::process::id())),
+        ));
+    }
+
+    #[test]
+    fn peer_api_lists_and_revokes_with_versioned_json() {
+        let path = std::env::temp_dir().join(format!("agent-send-test-{}-api", std::process::id()));
+        let mut daemon = Daemon::new(config(&path)).unwrap();
+        let pairing = daemon.request_pairing(advertisement("peer-api"));
+        daemon.confirm_pairing("peer-api", &pairing.code).unwrap();
+        let running = daemon.start().unwrap();
+        let mut stream = TcpStream::connect(running.local_addr()).unwrap();
+        stream
+            .write_all(b"GET /v1/peers HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("\"version\":1") && response.contains("peer-api"));
+        running.shutdown().unwrap();
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(std::env::temp_dir().join("trusted-peers.json"));
     }
 }

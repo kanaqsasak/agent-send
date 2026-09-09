@@ -59,6 +59,8 @@ The MCP adapter should be a separate process or thin adapter over this API. It s
 
 Begin with a versioned HTTP/JSON control protocol and streamed file bodies, compatible with LocalSend-style LAN deployment. Keep transport behind a trait so QUIC can be benchmarked without changing policy or UI. Transfers should support size/hash metadata, cancellation, progress, and resume tokens.
 
+Peer advertisements currently enter a deterministic in-process registry; the local API and trust persistence do not depend on a network discovery implementation. The future mDNS/Bonjour adapter should implement that seam and submit advertisements only (discovery metadata is never trust). This milestone intentionally does not open mDNS sockets, which keeps local tests deterministic and leaves firewall/Wi-Fi-isolation behavior for the adapter integration.
+
 ## Decisions to validate early
 
 1. Whether mDNS works reliably across the target OS firewalls and Wi-Fi isolation modes.

@@ -463,10 +463,17 @@ fn new_identity() -> LocalIdentity {
 }
 
 fn trusted_peers_path(identity_path: &Path) -> PathBuf {
-    identity_path
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join("trusted-peers.json")
+    // Keep custom identity files isolated from one another. In particular, two
+    // daemons in the same directory must not race while persisting their peer
+    // registries (the default identity keeps the conventional sibling name).
+    if identity_path.file_name().and_then(|name| name.to_str()) == Some("identity.json") {
+        identity_path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("trusted-peers.json")
+    } else {
+        identity_path.with_extension("trusted-peers.json")
+    }
 }
 
 fn load_trusted_peers(path: &Path) -> Result<PeerRegistry, DaemonError> {

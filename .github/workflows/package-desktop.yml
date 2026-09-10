@@ -62,6 +62,9 @@ jobs:
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci
+      - name: Check desktop deployment wiring
+        working-directory: apps/desktop
+        run: npm run check:deployment
       - name: Build frontend
         working-directory: apps/desktop
         run: npm run build

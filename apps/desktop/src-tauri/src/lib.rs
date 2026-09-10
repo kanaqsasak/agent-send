@@ -1,23 +1,23 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::Mutex,
+};
+
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager,
+    Manager, RunEvent,
 };
 
 const HIDDEN_FLAG: &str = "--hidden";
+const DAEMON_BIND: &str = "127.0.0.1:8765";
 
-/// The shell deliberately does not own the daemon process yet. Keeping this
-/// seam here means a future sidecar/service implementation can be added
-/// without changing tray, autostart, or window behavior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DaemonLifecycle {
-    External,
-}
-
-fn daemon_lifecycle_mode() -> DaemonLifecycle {
-    // The daemon is currently started by the platform/user service manager.
-    DaemonLifecycle::External
-}
+/// The packaged shell owns the bundled daemon. Keeping the child in managed
+/// state makes closing the tray app stop the daemon instead of leaving an
+/// orphan behind; login startup starts this same sequence before the UI.
+struct DaemonProcess(Mutex<Option<Child>>);
 
 fn launch_hidden() -> bool {
     std::env::args().any(|arg| arg == HIDDEN_FLAG)
@@ -25,13 +25,51 @@ fn launch_hidden() -> bool {
 }
 
 /// Return the loopback API endpoint used by the shell.
-///
-/// The daemon is intentionally a separate process. A packaged deployment can
-/// set AGENT_SEND_DAEMON_URL when it starts the daemon; local development uses
-/// the daemon's documented default port.
 #[tauri::command]
 fn daemon_endpoint() -> String {
     std::env::var("AGENT_SEND_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:8765".to_owned())
+}
+
+fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
+    let directories = [resource_dir.to_path_buf(), resource_dir.join("binaries")];
+    directories.iter().filter_map(|dir| fs::read_dir(dir).ok()).flat_map(|entries| {
+        entries.filter_map(Result::ok).map(|entry| entry.path())
+    }).find(|path| {
+        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            name.starts_with("agent-send-daemon-")
+                && (cfg!(windows) && name.ends_with(".exe") || !cfg!(windows) && !name.ends_with(".exe"))
+        })
+    })
+}
+
+fn start_daemon(app: &tauri::AppHandle) {
+    let resource_dir = match app.path().resource_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("agent-send: cannot locate bundled daemon resources: {error}");
+            return;
+        }
+    };
+    let Some(path) = daemon_path(&resource_dir) else {
+        // `tauri dev` intentionally permits using a separately started daemon.
+        eprintln!("agent-send: bundled daemon not found; use the documented development daemon");
+        return;
+    };
+    match Command::new(&path).args(["--bind", DAEMON_BIND]).spawn() {
+        Ok(child) => app.manage(DaemonProcess(Mutex::new(Some(child)))),
+        Err(error) => eprintln!("agent-send: failed to launch {}: {error}", path.display()),
+    }
+}
+
+fn stop_daemon(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<DaemonProcess>() {
+        if let Ok(mut child) = state.0.lock() {
+            if let Some(mut child) = child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
 }
 
 pub fn run() {
@@ -43,12 +81,13 @@ pub fn run() {
         )
         .invoke_handler(tauri::generate_handler![daemon_endpoint])
         .setup(|app| {
-            // Autostart passes --hidden; a regular launch should still open the
-            // window even though the config starts it invisible for both paths.
+            // Start the sidecar before showing the UI. Autostart passes
+            // --hidden, so login startup remains invisible but the daemon is
+            // already being launched by this process.
+            start_daemon(&app.handle());
             if !launch_hidden() {
                 show_window(&app.handle());
             }
-            let _daemon_lifecycle = daemon_lifecycle_mode();
 
             let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
             let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
@@ -85,8 +124,13 @@ pub fn run() {
                 let _ = window.hide();
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running agent-send desktop shell");
+        .build(tauri::generate_context!())
+        .expect("error while building agent-send desktop shell")
+        .run(|app, event| {
+            if matches!(event, RunEvent::Exit) {
+                stop_daemon(app);
+            }
+        });
 }
 
 fn show_window(app: &tauri::AppHandle) {

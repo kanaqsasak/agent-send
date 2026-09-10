@@ -62,10 +62,13 @@ runners). In addition to Node.js 20+ and Rust stable:
 build must first compile each Rust binary in release mode, then copy it to
 `src-tauri/binaries/<name>-<rust-target>` (and add `.exe` on Windows); Tauri
 includes the matching target in the installer. The daemon is the runtime
-service; CLI and MCP are optional executable companions for integrations. The
-current shell still treats the daemon as an external per-user service and does
-not launch or supervise these sidecars. Consequently, shipping the files does
-not yet provide service registration, upgrades, or a complete pairing UX.
+service; CLI and MCP are optional executable companions for integrations.
+
+On a packaged launch, the shell locates the target-specific daemon sidecar,
+starts it on `127.0.0.1:8765`, and only then shows the UI. The child is stopped
+when the shell exits. `--hidden` affects the shell window, not the daemon, so
+LAN discovery continues during login startup. `npm run tauri:dev` still permits
+a separately started daemon when no sidecar has been staged.
 
 The packaging workflow performs this staging and names uploaded artifacts with
 the app version, platform, and runner architecture. It never commits staged
@@ -85,7 +88,33 @@ credentials in this repository. Linux artifacts are not signed by this
 workflow.
 
 The checked-in PNGs under `src-tauri/icons` are functional placeholder branding
-and must be replaced before a public release. Firewall prompts, service
-registration, update feeds, and cross-platform runtime testing remain known
-limitations. Windows WebView2 and Linux WebKitGTK/AppIndicator packages are
-runtime prerequisites; unsigned macOS builds may require Gatekeeper approval.
+and must be replaced before a public release. Firewall prompts, update feeds, and
+cross-platform runtime testing remain known limitations. Windows WebView2 and
+Linux WebKitGTK/AppIndicator packages are runtime prerequisites; unsigned macOS
+builds may require Gatekeeper approval.
+
+### Login startup, uninstall, and troubleshooting
+
+The first packaged launch enables Tauri autostart for the current user. It uses
+one native per-user registration per platform: macOS LaunchAgent, Windows
+`HKCU\\...\\Run`, and Linux XDG autostart. The registration starts the app with
+`--hidden`; the app starts the bundled daemon before creating the tray UI. No
+administrator privileges or system-wide service are required. These are the
+supported registration mechanisms (the app does not claim Windows Task
+Scheduler or Linux systemd integration).
+
+For manual repair or cleanup, use the matching scripts with the installed app
+path: `scripts/register-macos.sh` / `unregister-macos.sh`,
+`scripts/register-windows.ps1` / `unregister-windows.ps1`, or
+`scripts/register-linux.sh` / `unregister-linux.sh`. Uninstalling should remove
+the app and its per-user registration; run the cleanup script if an older
+registration remains. User data under `~/.agent-send` (or the platform-equivalent
+home directory) is intentionally not deleted by uninstall.
+
+If the tray appears but says “Daemon unavailable”, confirm the installed bundle
+contains `agent-send-daemon-<rust-target>` and that `127.0.0.1:8765` is free.
+Run the daemon manually for development with the command in the repository
+README. On macOS inspect `launchctl print gui/$UID/com.agent-send.desktop`; on
+Windows inspect the current-user Run key; on Linux inspect
+`~/.config/autostart/agent-send.desktop`. `npm run check:deployment` provides a
+static smoke check, while `npm run build` checks the frontend only.

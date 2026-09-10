@@ -1996,16 +1996,129 @@ mod tests {
     }
 
     fn local_request(addr: SocketAddr, method: &str, path: &str, body: &str) -> String {
+        local_request_with_origin(addr, method, path, body, None)
+    }
+
+    fn local_request_with_origin(
+        addr: SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+        origin: Option<&str>,
+    ) -> String {
+        let origin_header = origin
+            .map(|origin| format!("Origin: {origin}\r\n"))
+            .unwrap_or_default();
         let mut stream = TcpStream::connect(addr).unwrap();
         write!(
             stream,
-            "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
+            "{method} {path} HTTP/1.1\r\nHost: localhost\r\n{origin_header}Content-Length: {}\r\n\r\n{body}",
             body.len()
         )
         .unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         response
+    }
+
+    fn agent_request_with_origin(
+        addr: SocketAddr,
+        token: &str,
+        origin: Option<&str>,
+    ) -> String {
+        let body = serde_json::json!({ "operation": "peers.list", "params": {} }).to_string();
+        let origin_header = origin
+            .map(|origin| format!("Origin: {origin}\r\n"))
+            .unwrap_or_default();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        write!(
+            stream,
+            "POST /v1/agent HTTP/1.1\r\nHost: localhost\r\n{origin_header}Authorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn disallowed_origin_is_rejected_before_pairing_revocation_or_agent_actions() {
+        let path = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-cors-regression",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        let daemon = Daemon::new(config(&path)).unwrap();
+        let running = daemon.start().unwrap();
+        let addr = running.local_addr();
+        let advertisement = serde_json::to_string(&advertisement("cors-peer")).unwrap();
+        let evil = Some("https://evil.example");
+
+        let rejected = local_request_with_origin(
+            addr,
+            "POST",
+            "/v1/pairings",
+            &advertisement,
+            evil,
+        );
+        assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(rejected.contains("origin_not_allowed"));
+        assert!(daemon.peers().is_empty());
+
+        let allowed = local_request_with_origin(
+            addr,
+            "POST",
+            "/v1/pairings",
+            &advertisement,
+            Some("tauri://localhost"),
+        );
+        assert!(allowed.starts_with("HTTP/1.1 200 OK"));
+        assert!(allowed.contains("Access-Control-Allow-Origin: tauri://localhost\r\n"));
+        let pairing: PairingResponse =
+            serde_json::from_str(allowed.split_once("\r\n\r\n").unwrap().1).unwrap();
+
+        let rejected_confirm = local_request_with_origin(
+            addr,
+            "POST",
+            "/v1/pairings/confirm",
+            &serde_json::json!({ "peer_id": "cors-peer", "code": pairing.code }).to_string(),
+            evil,
+        );
+        assert!(rejected_confirm.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(!daemon.peers()[0].trusted);
+
+        let confirmed = local_request(
+            addr,
+            "POST",
+            "/v1/pairings/confirm",
+            &serde_json::json!({ "peer_id": "cors-peer", "code": pairing.code }).to_string(),
+        );
+        assert!(confirmed.starts_with("HTTP/1.1 200 OK"));
+        let token = daemon
+            .issue_agent_token(AgentScope {
+                peer_ids: ["cors-peer".to_owned()].into_iter().collect(),
+                ..AgentScope::default()
+            })
+            .unwrap();
+        let audit_before = running.audit_entries().len();
+        let rejected_agent = agent_request_with_origin(addr, &token.token, evil);
+        assert!(rejected_agent.starts_with("HTTP/1.1 403 Forbidden"));
+        assert_eq!(running.audit_entries().len(), audit_before);
+
+        let rejected_revoke = local_request_with_origin(
+            addr,
+            "DELETE",
+            "/v1/peers/cors-peer",
+            "",
+            evil,
+        );
+        assert!(rejected_revoke.starts_with("HTTP/1.1 403 Forbidden"));
+        assert!(daemon.peers()[0].trusted);
+
+        running.shutdown().unwrap();
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(trusted_peers_path(&path));
     }
 
     #[test]

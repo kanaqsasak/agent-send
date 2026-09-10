@@ -32,6 +32,9 @@ humans, while exposing a safe local API/CLI/MCP surface for AI agents.
 ### M1 — Daemon skeleton
 
 - Add a Rust daemon crate with structured configuration and graceful shutdown.
+  Local development run commands are documented in `README.md`; use
+  `cargo run -p agent-send-daemon -- --bind 127.0.0.1:0` (or add
+  `--hidden --identity-path /tmp/agent-send-dev.json --bind 127.0.0.1:8123`).
 - Add a loopback-only local API with versioned request/response types.
 - Add logging, health status, and a persistent identity/key placeholder.
 - Add platform-neutral folder capability validation; reject traversal and symlink escapes.

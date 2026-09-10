@@ -46,17 +46,42 @@ pub const API_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Config {
     /// The local API must remain loopback-only.
+    #[serde(default = "default_bind_addr")]
     pub bind_addr: SocketAddr,
     /// File containing the daemon's local identity placeholder.
+    #[serde(default = "default_identity_path")]
     pub identity_path: PathBuf,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            bind_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
+            bind_addr: default_bind_addr(),
             identity_path: default_identity_path(),
         }
+    }
+}
+
+impl Config {
+    /// The per-user configuration file used by the daemon entrypoint.
+    pub fn default_path() -> PathBuf {
+        user_data_dir().join("config.json")
+    }
+
+    /// Load the per-user config, treating a missing file as the default.
+    pub fn load_user() -> Result<Self, DaemonError> {
+        let path = Self::default_path();
+        match fs::read_to_string(path) {
+            Ok(contents) => serde_json::from_str(&contents).map_err(|error| {
+                DaemonError::Config(io::Error::new(io::ErrorKind::InvalidData, error))
+            }),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(DaemonError::Config(error)),
+        }
+    }
+
+    pub fn is_loopback(&self) -> bool {
+        self.bind_addr.ip().is_loopback()
     }
 }
 
@@ -213,6 +238,8 @@ pub enum DaemonError {
     NonLoopbackBind(SocketAddr),
     #[error("identity path is required")]
     MissingIdentityPath,
+    #[error("configuration storage failed: {0}")]
+    Config(#[source] io::Error),
     #[error("identity storage failed: {0}")]
     Identity(#[source] io::Error),
     #[error("peer storage failed: {0}")]
@@ -911,12 +938,19 @@ fn save_trusted_peers(path: &Path, registry: &PeerRegistry) -> Result<(), Daemon
     fs::write(path, contents).map_err(DaemonError::PeerStorage)
 }
 
-fn default_identity_path() -> PathBuf {
+fn default_bind_addr() -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], 0))
+}
+
+fn user_data_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".agent-send")
-        .join("identity.json")
+}
+
+fn default_identity_path() -> PathBuf {
+    user_data_dir().join("identity.json")
 }
 
 #[cfg(test)]
@@ -927,6 +961,14 @@ mod tests {
 
     fn config(path: &Path) -> Config {
         Config::with_identity_path(path)
+    }
+
+    #[test]
+    fn config_defaults_are_loopback_and_fill_missing_file_fields() {
+        let config = serde_json::from_str::<Config>("{}").unwrap();
+        assert_eq!(config.bind_addr, "127.0.0.1:0".parse().unwrap());
+        assert!(config.is_loopback());
+        assert_eq!(config.identity_path, Config::default().identity_path);
     }
 
     #[test]

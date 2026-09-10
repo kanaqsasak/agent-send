@@ -41,7 +41,23 @@ cargo build -p agent-send-cli
 cargo run -p agent-send-cli -- demo
 ```
 
-The desktop app will be added after the core protocol and security boundaries are validated.
+Run the background daemon locally (its config is read from
+`~/.agent-send/config.json`; the identity is persisted at
+`~/.agent-send/identity.json`):
+
+```sh
+cargo run -p agent-send-daemon -- --bind 127.0.0.1:0
+```
+
+Use a separate identity for development, disable LAN discovery, and query its
+local health API with:
+
+```sh
+cargo run -p agent-send-daemon -- --identity-path /tmp/agent-send-dev.json --hidden --bind 127.0.0.1:8123
+cargo run -p agent-send-cli -- health --addr 127.0.0.1:8123
+```
+
+Only loopback addresses are accepted; stop the daemon with Ctrl-C. The desktop app will be added after the core protocol and security boundaries are validated.
 
 ## Planned clients
 

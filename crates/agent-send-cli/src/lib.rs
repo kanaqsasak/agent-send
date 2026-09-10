@@ -9,13 +9,26 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HELP: &str = "agent-send\n\nUSAGE:\n    agent-send --help\n    agent-send health --addr HOST:PORT\n    agent-send peers --addr HOST:PORT\n    agent-send demo\n";
+const HELP: &str = "agent-send\n\nUSAGE:\n    agent-send --help\n    agent-send health --addr HOST:PORT\n    agent-send peers --addr HOST:PORT\n    agent-send send --addr HOST:PORT --token TOKEN --peer-id ID --source-folder ID --destination-folder ID --path PATH --idempotency-key KEY\n    agent-send demo\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Help,
-    Health { addr: SocketAddr },
-    Peers { addr: SocketAddr },
+    Health {
+        addr: SocketAddr,
+    },
+    Peers {
+        addr: SocketAddr,
+    },
+    Send {
+        addr: SocketAddr,
+        token: String,
+        peer_id: String,
+        source_folder_id: String,
+        source_paths: Vec<String>,
+        destination_folder_id: String,
+        idempotency_key: String,
+    },
     Demo,
 }
 
@@ -54,14 +67,71 @@ where
             }
         }
         [command] if command == "demo" => Ok(Command::Demo),
+        args if args.first().is_some_and(|command| command == "send") => {
+            parse_send_args(&args[1..])
+        }
         _ => Err(ParseError(
-            "usage: agent-send {--help|health|peers} --addr HOST:PORT, or demo".into(),
+            "usage: agent-send {--help|health|peers} --addr HOST:PORT, send ..., or demo".into(),
         )),
     }
 }
 
 pub fn help() -> &'static str {
     HELP
+}
+
+fn parse_send_args(args: &[String]) -> Result<Command, ParseError> {
+    let mut addr: Option<SocketAddr> = None;
+    let mut token = None;
+    let mut peer_id = None;
+    let mut source_folder_id = None;
+    let mut source_paths = Vec::new();
+    let mut destination_folder_id = None;
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| ParseError(format!("{flag} requires a value")))?;
+        match flag {
+            "--addr" => {
+                addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ParseError("--addr must be HOST:PORT".into()))?,
+                )
+            }
+            "--token" => token = Some(value.clone()),
+            "--peer-id" => peer_id = Some(value.clone()),
+            "--source-folder" => source_folder_id = Some(value.clone()),
+            "--path" => source_paths.push(value.clone()),
+            "--destination-folder" => destination_folder_id = Some(value.clone()),
+            "--idempotency-key" => idempotency_key = Some(value.clone()),
+            _ => return Err(ParseError(format!("unknown send option: {flag}"))),
+        }
+        index += 2;
+    }
+    let addr = addr.ok_or_else(|| ParseError("send requires --addr".into()))?;
+    if !addr.ip().is_loopback() {
+        return Err(ParseError("--addr must be a loopback address".into()));
+    }
+    Ok(Command::Send {
+        addr,
+        token: token.ok_or_else(|| ParseError("send requires --token".into()))?,
+        peer_id: peer_id.ok_or_else(|| ParseError("send requires --peer-id".into()))?,
+        source_folder_id: source_folder_id
+            .ok_or_else(|| ParseError("send requires --source-folder".into()))?,
+        source_paths: if source_paths.is_empty() {
+            return Err(ParseError("send requires at least one --path".into()));
+        } else {
+            source_paths
+        },
+        destination_folder_id: destination_folder_id
+            .ok_or_else(|| ParseError("send requires --destination-folder".into()))?,
+        idempotency_key: idempotency_key
+            .ok_or_else(|| ParseError("send requires --idempotency-key".into()))?,
+    })
 }
 
 fn request(addr: SocketAddr, path: &str) -> Result<String, Box<dyn Error>> {
@@ -93,6 +163,21 @@ pub fn run(command: Command) -> Result<(), Box<dyn Error>> {
         Command::Help => print!("{HELP}"),
         Command::Health { addr } => println!("{}", request(addr, "/v1/health")?),
         Command::Peers { addr } => println!("{}", request(addr, "/v1/peers")?),
+        Command::Send {
+            addr,
+            token,
+            peer_id,
+            source_folder_id,
+            source_paths,
+            destination_folder_id,
+            idempotency_key,
+        } => {
+            let body = serde_json::json!({"operation":"transfers.send","params":{
+                "peer_id": peer_id, "source_folder_id": source_folder_id, "source_paths": source_paths,
+                "destination_folder_id": destination_folder_id, "idempotency_key": idempotency_key
+            }}).to_string();
+            println!("{}", post_agent(addr, &token, &body)?);
+        }
         Command::Demo => {
             let result = run_demo()?;
             println!(
@@ -164,6 +249,27 @@ pub fn run_demo() -> Result<DemoResult, Box<dyn Error>> {
     Ok(result)
 }
 
+fn post_agent(addr: SocketAddr, token: &str, body: &str) -> Result<String, Box<dyn Error>> {
+    if !addr.ip().is_loopback() {
+        return Err(ParseError("--addr must be a loopback address".into()).into());
+    }
+    let mut stream = TcpStream::connect(addr)?;
+    write!(stream, "POST /v1/agent HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (header, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or("invalid HTTP response")?;
+    if !header.starts_with("HTTP/1.1 200 ") {
+        return Err(format!(
+            "daemon returned {}",
+            header.lines().next().unwrap_or("error")
+        )
+        .into());
+    }
+    Ok(body.to_owned())
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
@@ -186,6 +292,28 @@ mod tests {
             }
         );
         assert!(parse_args(["peers", "--addr", "8.8.8.8:53"]).is_err());
+        let command = parse_args([
+            "send",
+            "--addr",
+            "127.0.0.1:1",
+            "--token",
+            "secret",
+            "--peer-id",
+            "peer",
+            "--source-folder",
+            "source",
+            "--destination-folder",
+            "destination",
+            "--path",
+            "file.txt",
+            "--idempotency-key",
+            "key",
+        ])
+        .unwrap();
+        assert!(
+            matches!(command, Command::Send { source_paths, .. } if source_paths == ["file.txt"])
+        );
+        assert!(parse_args(["send", "--addr", "127.0.0.1:1"]).is_err());
     }
 
     #[test]

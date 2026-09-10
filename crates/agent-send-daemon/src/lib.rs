@@ -980,108 +980,121 @@ fn handle_connection(
     let body = parts.next().unwrap_or_default();
     let first_line = head.lines().next().unwrap_or_default();
     let method_path = first_line.split_whitespace().take(2).collect::<Vec<_>>();
-    let (status, body) = match (method_path.first().copied(), method_path.get(1).copied()) {
-        (Some("OPTIONS"), _) => ("204 No Content", String::new()),
-        (Some("GET"), Some("/v1/health")) => (
-            "200 OK",
-            serde_json::to_string(&HealthResponse {
-                version: API_VERSION,
-                status: HealthStatus::Ok,
-                identity_id: identity.id.clone(),
-            })
-            .unwrap(),
-        ),
-        (Some("GET"), Some("/v1/peers")) => {
-            let peers = registry.lock().unwrap().list();
-            (
+    let origin = header_value(head, "origin");
+    let origin_allowed = origin.map(is_allowed_origin).unwrap_or(true);
+    let (status, body) = if !origin_allowed {
+        (
+            "403 Forbidden",
+            "{\"error\":\"origin_not_allowed\"}".to_owned(),
+        )
+    } else {
+        match (method_path.first().copied(), method_path.get(1).copied()) {
+            (Some("OPTIONS"), _) => ("204 No Content", String::new()),
+            (Some("GET"), Some("/v1/health")) => (
                 "200 OK",
-                serde_json::to_string(&PeersResponse {
+                serde_json::to_string(&HealthResponse {
                     version: API_VERSION,
-                    peers,
+                    status: HealthStatus::Ok,
+                    identity_id: identity.id.clone(),
                 })
                 .unwrap(),
-            )
-        }
-        (Some("POST"), Some("/v1/agent")) => handle_agent_request(
-            identity,
-            head,
-            body,
-            registry,
-            transfer,
-            agent_tokens,
-            agent_transfers,
-            audit,
-        ),
-        (Some("POST"), Some("/v1/pairings")) | (Some("POST"), Some("/v1/pairing")) => {
-            match serde_json::from_str::<PairingRequest>(body) {
-                Ok(request) => {
-                    let material = match (request.code, request.pairing_secret) {
-                        (None, None) => Ok(None),
-                        (Some(code), Some(secret)) => PairingSecret::from_hex(&secret)
-                            .map(|secret| Some((code, secret)))
-                            .map_err(|_| {
-                                PairingError::Secret(PeerChannelError::InvalidPairingSecret)
-                            }),
-                        _ => Err(PairingError::IncompleteMaterial),
-                    };
-                    match material.and_then(|material| {
-                        registry.lock().unwrap().request_pairing_with_material(
-                            request.advertisement,
-                            now_seconds(),
-                            material,
-                        )
-                    }) {
-                        Ok(response) => ("200 OK", serde_json::to_string(&response).unwrap()),
-                        Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
-                    }
-                }
-                Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
-            }
-        }
-        (Some("POST"), Some("/v1/pairings/confirm"))
-        | (Some("POST"), Some("/v1/pairing/confirm")) => {
-            match serde_json::from_str::<ConfirmPairing>(body) {
-                Ok(request) => {
-                    let mut peers = registry.lock().unwrap();
-                    let before = peers.clone();
-                    let confirmed =
-                        peers.confirm_pairing(&request.peer_id, &request.code, now_seconds());
-                    if confirmed && peer_store.save(&peers.stored_trust()).is_err() {
-                        *peers = before;
-                        (
-                            "500 Internal Server Error",
-                            "{\"error\":\"storage_failed\"}".into(),
-                        )
-                    } else if confirmed {
-                        ("200 OK", "{\"confirmed\":true}".into())
-                    } else {
-                        ("400 Bad Request", "{\"confirmed\":false}".into())
-                    }
-                }
-                Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
-            }
-        }
-        (Some("DELETE"), Some(path)) if path.starts_with("/v1/peers/") => {
-            let id = &path["/v1/peers/".len()..];
-            let mut peers = registry.lock().unwrap();
-            let before = peers.clone();
-            let revoked = peers.revoke(id);
-            if revoked && peer_store.save(&peers.stored_trust()).is_err() {
-                *peers = before;
+            ),
+            (Some("GET"), Some("/v1/peers")) => {
+                let peers = registry.lock().unwrap().list();
                 (
-                    "500 Internal Server Error",
-                    "{\"error\":\"storage_failed\"}".into(),
+                    "200 OK",
+                    serde_json::to_string(&PeersResponse {
+                        version: API_VERSION,
+                        peers,
+                    })
+                    .unwrap(),
                 )
-            } else if revoked {
-                ("200 OK", "{\"revoked\":true}".into())
-            } else {
-                ("404 Not Found", "{\"error\":\"peer_not_found\"}".into())
             }
+            (Some("POST"), Some("/v1/agent")) => handle_agent_request(
+                identity,
+                head,
+                body,
+                registry,
+                transfer,
+                agent_tokens,
+                agent_transfers,
+                audit,
+            ),
+            (Some("POST"), Some("/v1/pairings")) | (Some("POST"), Some("/v1/pairing")) => {
+                match serde_json::from_str::<PairingRequest>(body) {
+                    Ok(request) => {
+                        let material = match (request.code, request.pairing_secret) {
+                            (None, None) => Ok(None),
+                            (Some(code), Some(secret)) => PairingSecret::from_hex(&secret)
+                                .map(|secret| Some((code, secret)))
+                                .map_err(|_| {
+                                    PairingError::Secret(PeerChannelError::InvalidPairingSecret)
+                                }),
+                            _ => Err(PairingError::IncompleteMaterial),
+                        };
+                        match material.and_then(|material| {
+                            registry.lock().unwrap().request_pairing_with_material(
+                                request.advertisement,
+                                now_seconds(),
+                                material,
+                            )
+                        }) {
+                            Ok(response) => ("200 OK", serde_json::to_string(&response).unwrap()),
+                            Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
+                        }
+                    }
+                    Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
+                }
+            }
+            (Some("POST"), Some("/v1/pairings/confirm"))
+            | (Some("POST"), Some("/v1/pairing/confirm")) => {
+                match serde_json::from_str::<ConfirmPairing>(body) {
+                    Ok(request) => {
+                        let mut peers = registry.lock().unwrap();
+                        let before = peers.clone();
+                        let confirmed =
+                            peers.confirm_pairing(&request.peer_id, &request.code, now_seconds());
+                        if confirmed && peer_store.save(&peers.stored_trust()).is_err() {
+                            *peers = before;
+                            (
+                                "500 Internal Server Error",
+                                "{\"error\":\"storage_failed\"}".into(),
+                            )
+                        } else if confirmed {
+                            ("200 OK", "{\"confirmed\":true}".into())
+                        } else {
+                            ("400 Bad Request", "{\"confirmed\":false}".into())
+                        }
+                    }
+                    Err(_) => ("400 Bad Request", "{\"error\":\"invalid_request\"}".into()),
+                }
+            }
+            (Some("DELETE"), Some(path)) if path.starts_with("/v1/peers/") => {
+                let id = &path["/v1/peers/".len()..];
+                let mut peers = registry.lock().unwrap();
+                let before = peers.clone();
+                let revoked = peers.revoke(id);
+                if revoked && peer_store.save(&peers.stored_trust()).is_err() {
+                    *peers = before;
+                    (
+                        "500 Internal Server Error",
+                        "{\"error\":\"storage_failed\"}".into(),
+                    )
+                } else if revoked {
+                    ("200 OK", "{\"revoked\":true}".into())
+                } else {
+                    ("404 Not Found", "{\"error\":\"peer_not_found\"}".into())
+                }
+            }
+            _ => ("404 Not Found", "{\"error\":\"not_found\"}".to_owned()),
         }
-        _ => ("404 Not Found", "{\"error\":\"not_found\"}".to_owned()),
     };
+    let cors = origin
+        .filter(|value| is_allowed_origin(value))
+        .map(|value| format!("Access-Control-Allow-Origin: {value}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{cors}Access-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -1133,7 +1146,9 @@ where
         (address, paired_peer)
     };
     let channel = SecurePeerChannel::new(identity.id.clone(), paired_peer)?;
-    Ok(send_socket_transfer(transfer, channel, address, request, cancel, progress)?)
+    Ok(send_socket_transfer(
+        transfer, channel, address, request, cancel, progress,
+    )?)
 }
 
 fn handle_agent_request(
@@ -1253,11 +1268,16 @@ fn handle_agent_request(
                     .as_ref()
                     .ok()
                     .map(|status| status.transfer_id.clone()),
-                if !is_send || result
-                    .as_ref()
-                    .map(|status| status.state == AgentTransferState::Completed)
-                    .unwrap_or(false)
-                { "ok" } else { "denied" },
+                if !is_send
+                    || result
+                        .as_ref()
+                        .map(|status| status.state == AgentTransferState::Completed)
+                        .unwrap_or(false)
+                {
+                    "ok"
+                } else {
+                    "denied"
+                },
             );
             result.and_then(|status| {
                 serde_json::to_value(status)
@@ -1317,6 +1337,13 @@ fn handle_agent_request(
 
 fn agent_error(status: &'static str, code: &str) -> (&'static str, String) {
     (status, serde_json::json!({ "error": code }).to_string())
+}
+
+fn is_allowed_origin(origin: &str) -> bool {
+    matches!(
+        origin,
+        "tauri://localhost" | "http://localhost" | "http://127.0.0.1"
+    )
 }
 
 fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {

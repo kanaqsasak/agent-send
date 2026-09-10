@@ -43,7 +43,7 @@ the popover; blur hides it. Right-click exposes About and Quit.
 1. Test native behavior and installers on actual Windows and Linux hosts.
 2. Configure real signing/notarization credentials and verify release artifacts.
 3. Replace placeholder app branding if the radar mark is not accepted.
-4. Add a first-class CLI command for sending files between independently running daemon processes; current `demo` and socket integration tests exercise the transfer path but the CLI does not yet expose arbitrary-process send/receive.
+4. Add a first-class CLI command for receiving/cancelling and richer progress output; `agent-send send` now submits an authenticated transfer to an independently running daemon and waits for the socket delivery result.
 5. Review pairing UX and secret storage for production; trusted-peer secrets are currently protected by owner-only local JSON files, not an OS credential store.
 6. Run LAN tests across two physical laptops, including firewall, Wi-Fi isolation, sleep/wake, and interface changes.
 7. Reconcile stale milestone checkboxes in `PLAN.md` only after the corresponding exit criteria are verified.

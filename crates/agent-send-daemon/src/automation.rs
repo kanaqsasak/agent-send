@@ -330,7 +330,12 @@ impl AgentTransfers {
         transfer_id: &str,
         error: impl Into<String>,
     ) -> Result<AgentTransferStatus, AutomationError> {
-        self.update_result(actor, transfer_id, AgentTransferState::Failed, Some(error.into()))
+        self.update_result(
+            actor,
+            transfer_id,
+            AgentTransferState::Failed,
+            Some(error.into()),
+        )
     }
 
     pub fn status(
@@ -353,10 +358,7 @@ impl AgentTransfers {
             .get_mut(transfer_id)
             .filter(|transfer| transfer.actor_id == actor.id)
             .ok_or(AutomationError::TransferNotFound)?;
-        if matches!(
-            transfer.status.state,
-            AgentTransferState::Submitted
-        ) {
+        if matches!(transfer.status.state, AgentTransferState::Submitted) {
             transfer.status.state = AgentTransferState::Cancelled;
         }
         Ok(transfer.status.clone())

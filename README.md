@@ -40,6 +40,11 @@ Build and run the deterministic local transfer demo:
 cargo build -p agent-send-cli
 cargo run -p agent-send-cli -- demo
 
+# Send through an independently running, authenticated daemon
+agent-send send --addr 127.0.0.1:41641 --token agent_... \
+  --peer-id PEER_ID --source-folder shared --destination-folder incoming \
+  --path relative/file.txt --idempotency-key unique-request-id
+
 # Local-only throughput and idle wall-clock measurement (not a CPU benchmark)
 cargo run -p agent-send-daemon --example measure
 ```
@@ -97,6 +102,6 @@ never falls back to unauthenticated transport.
 ## Planned clients
 
 1. Desktop tray app (macOS, Windows, Linux)
-2. CLI (`agent-send health`, `agent-send peers`, `agent-send demo`)
+2. CLI (`agent-send health`, `agent-send peers`, `agent-send send`, `agent-send demo`)
 3. Local agent API / MCP adapter
 4. Mobile clients, if the protocol proves useful beyond laptops

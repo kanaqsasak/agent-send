@@ -19,15 +19,15 @@ const DAEMON_BIND: &str = "127.0.0.1:8765";
 /// orphan behind; login startup starts this same sequence before the UI.
 struct DaemonProcess(Mutex<Option<Child>>);
 
-fn launch_hidden() -> bool {
-    std::env::args().any(|arg| arg == HIDDEN_FLAG)
-        || std::env::var_os("AGENT_SEND_START_HIDDEN").is_some()
-}
-
 /// Return the loopback API endpoint used by the shell.
 #[tauri::command]
 fn daemon_endpoint() -> String {
     std::env::var("AGENT_SEND_DAEMON_URL").unwrap_or_else(|_| "http://127.0.0.1:8765".to_owned())
+}
+
+#[tauri::command]
+fn app_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
 }
 
 fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
@@ -96,26 +96,26 @@ pub fn run() {
                 .args([HIDDEN_FLAG])
                 .build(),
         )
-        .invoke_handler(tauri::generate_handler![daemon_endpoint])
+        .invoke_handler(tauri::generate_handler![daemon_endpoint, app_version])
         .setup(|app| {
             // Start the sidecar before showing the UI. Autostart passes
             // --hidden, so login startup remains invisible but the daemon is
             // already being launched by this process.
             start_daemon(&app.handle());
-            if !launch_hidden() {
-                show_window(&app.handle());
-            }
+            // This is a tray-only application on macOS. The window is opened
+            // only by a left click on the tray icon.
+            let _ = app.handle().set_dock_visibility(false);
 
-            let show = MenuItem::with_id(app, "show", "Show", true, None::<&str>)?;
-            let hide = MenuItem::with_id(app, "hide", "Hide", true, None::<&str>)?;
+            let about = MenuItem::with_id(app, "about", "About agent-send", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
+            let menu = Menu::with_items(app, &[&about, &quit])?;
 
             TrayIconBuilder::new()
                 .icon(tauri::image::Image::from_bytes(include_bytes!(
                     "../icons/32x32.png"
                 ))?)
                 .menu(&menu)
+                .show_menu_on_left_click(false)
                 .tooltip("agent-send")
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -129,8 +129,7 @@ pub fn run() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "show" => show_window(app),
-                    "hide" => hide_window(app),
+                    "about" => show_window(app),
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -177,11 +176,5 @@ fn show_window_at(app: &tauri::AppHandle, rect: tauri::Rect) {
         let _ = window.set_position(PhysicalPosition::new(x, y));
         let _ = window.show();
         let _ = window.set_focus();
-    }
-}
-
-fn hide_window(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        let _ = window.hide();
     }
 }

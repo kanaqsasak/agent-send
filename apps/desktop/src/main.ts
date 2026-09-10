@@ -64,7 +64,7 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <section class="shell">
     <header data-tauri-drag-region><span class="mark" aria-hidden="true">●</span><h1>agent-send</h1><nav class="window-controls" aria-label="Window controls"><button id="hide-window" type="button" title="Hide window" aria-label="Hide window">—</button><button id="close-window" type="button" title="Hide to tray" aria-label="Hide to tray">×</button></nav></header>
-    <p class="subtitle">Private local file transfer</p>
+    <p class="subtitle">Private local file transfer · <span id="version">v—</span></p>
     <div class="health" aria-live="polite"><span class="dot pending"></span><span id="status">Connecting…</span></div>
     <p class="endpoint" id="endpoint"></p>
     <p class="error" id="error" role="alert" hidden></p>
@@ -85,6 +85,7 @@ app.innerHTML = `
 
 const status = document.querySelector<HTMLSpanElement>("#status")!;
 const endpoint = document.querySelector<HTMLParagraphElement>("#endpoint")!;
+const version = document.querySelector<HTMLSpanElement>("#version")!;
 const identity = document.querySelector<HTMLElement>("#identity")!;
 const peersElement = document.querySelector<HTMLDivElement>("#peers")!;
 const errorElement = document.querySelector<HTMLParagraphElement>("#error")!;
@@ -154,7 +155,7 @@ async function loadPeers() {
 
 async function checkHealth() {
   status.textContent = "Checking daemon…"; dot.className = "dot pending";
-  try { const url = await daemon.endpoint(); endpoint.textContent = url; const health = await daemon.health(); identity.textContent = health.identity_id; status.textContent = `Daemon healthy · API v${health.version}`; dot.className = "dot online"; clearError(); await loadPeers(); }
+  try { const url = await daemon.endpoint(); endpoint.textContent = url; version.textContent = `v${await invoke<string>("app_version").catch(() => "0.1.0")}`; const health = await daemon.health(); identity.textContent = health.identity_id; status.textContent = `Daemon healthy · API v${health.version}`; dot.className = "dot online"; clearError(); await loadPeers(); }
   catch { status.textContent = "Daemon unavailable"; dot.className = "dot offline"; identity.textContent = "Unavailable"; showError("The local daemon is unavailable. Start it and try again."); }
 }
 

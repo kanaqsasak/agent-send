@@ -3,6 +3,7 @@ members = [
     "crates/agent-send-core",
     "crates/agent-send-daemon",
     "crates/agent-send-cli",
+    "crates/agent-send-mcp",
 ]
 resolver = "2"
 

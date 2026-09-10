@@ -1,0 +1,20 @@
+[package]
+name = "agent-send-mcp"
+description = "Safe stdio MCP adapter for the agent-send daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+agent-send-daemon = { path = "../agent-send-daemon" }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+thiserror.workspace = true
+
+[lib]
+name = "agent_send_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "agent-send-mcp"
+path = "src/main.rs"

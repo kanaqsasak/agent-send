@@ -27,9 +27,16 @@ use std::{
 use thiserror::Error;
 
 pub const PEER_PROTOCOL_VERSION: u32 = 1;
+/// Bound connection setup and per-frame I/O so a paired peer cannot hold a
+/// transfer worker indefinitely.
+pub const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const PEER_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const KEY_DOMAIN: &[u8] = b"agent-send peer channel key v1";
 const AAD_DOMAIN: &[u8] = b"agent-send peer frame v1";
-const MAX_FRAME_BYTES: usize = CHUNK_SIZE + 16 * 1024;
+// JSON's numeric-byte representation expands the encrypted frame far beyond
+// its 64 KiB file payload, so this is a wire-frame bound rather than a
+// plaintext chunk bound.
+const MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 
 /// Secret established during an out-of-band, human-confirmed pairing.
 #[derive(Clone, PartialEq, Eq)]
@@ -406,14 +413,22 @@ pub struct SocketPeerTransport {
 
 impl SocketPeerTransport {
     pub fn connect(address: SocketAddr) -> Result<Self, PeerTransportError> {
-        Ok(Self {
-            stream: TcpStream::connect(address)?,
-        })
+        let stream = TcpStream::connect_timeout(&address, PEER_CONNECT_TIMEOUT)?;
+        configure_timeouts(&stream)?;
+        Ok(Self { stream })
     }
 
     pub fn from_stream(stream: TcpStream) -> Self {
+        // Accepted peer sockets must have the same bounded I/O behavior as
+        // outgoing sockets. A failure here is handled by the caller's I/O path.
+        let _ = configure_timeouts(&stream);
         Self { stream }
     }
+}
+
+fn configure_timeouts(stream: &TcpStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(PEER_IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(PEER_IO_TIMEOUT))
 }
 
 impl PeerTransport for SocketPeerTransport {
@@ -703,6 +718,7 @@ fn associated_data(version: u32, sender_id: &str, recipient_id: &str, sequence: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{io::Write, net::TcpListener};
 
     fn peer(id: &str) -> PairedPeer {
         PairedPeer::new(id, PairingSecret::new([7; 32])).unwrap()
@@ -750,6 +766,91 @@ mod tests {
             bob.open(frame),
             Err(PeerChannelError::UnexpectedSequence { .. })
         ));
+    }
+
+    #[test]
+    fn deterministic_ciphertext_mutations_fail_closed() {
+        let mut alice = SecurePeerChannel::new("alice", peer("bob")).unwrap();
+        let mut bob = SecurePeerChannel::new("bob", peer("alice")).unwrap();
+        let frame = alice.seal(&manifest()).unwrap();
+        for index in 0..frame.ciphertext.len() {
+            let mut malformed = frame.clone();
+            malformed.ciphertext[index] ^= (index as u8).wrapping_add(1);
+            assert_eq!(
+                bob.open(malformed),
+                Err(PeerChannelError::AuthenticationFailed),
+                "ciphertext byte {index} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_transport_rejects_a_deterministic_malformed_frame_corpus() {
+        let corpus = [
+            (0u32, Vec::new()),
+            (1u32, vec![0]),
+            (4u32, b"null".to_vec()),
+            (2u32, b"{}".to_vec()),
+            ((MAX_FRAME_BYTES as u32) + 1, Vec::new()),
+            (3u32, vec![b'{']),
+        ];
+        for (declared_length, payload) in corpus {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let sender = std::thread::spawn(move || {
+                let mut stream = TcpStream::connect(address).unwrap();
+                stream.write_all(&declared_length.to_be_bytes()).unwrap();
+                stream.write_all(&payload).unwrap();
+            });
+            let (stream, _) = listener.accept().unwrap();
+            sender.join().unwrap();
+            let mut transport = SocketPeerTransport::from_stream(stream);
+            assert!(transport.receive().is_err(), "length {declared_length}");
+        }
+    }
+
+    #[test]
+    fn socket_transport_carries_a_maximum_sized_chunk_within_its_wire_bound() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let receiver = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            SocketPeerTransport::from_stream(stream)
+                .receive()
+                .unwrap()
+                .unwrap()
+        });
+        let mut channel = SecurePeerChannel::new("alice", peer("bob")).unwrap();
+        let frame = channel
+            .seal(&PeerMessage::FileChunk {
+                transfer_id: "transfer-1".into(),
+                offset: 0,
+                bytes: vec![255; CHUNK_SIZE],
+            })
+            .unwrap();
+        SocketPeerTransport::connect(address)
+            .unwrap()
+            .send(frame.clone())
+            .unwrap();
+        assert_eq!(receiver.join().unwrap(), frame);
+    }
+
+    #[test]
+    fn socket_transport_sets_bounded_io_timeouts() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = std::thread::spawn(move || listener.accept().unwrap().0);
+        let transport = SocketPeerTransport::connect(address).unwrap();
+        let incoming = accepted.join().unwrap();
+        assert_eq!(
+            transport.stream.read_timeout().unwrap(),
+            Some(PEER_IO_TIMEOUT)
+        );
+        let accepted_transport = SocketPeerTransport::from_stream(incoming);
+        assert_eq!(
+            accepted_transport.stream.write_timeout().unwrap(),
+            Some(PEER_IO_TIMEOUT)
+        );
     }
 
     #[test]

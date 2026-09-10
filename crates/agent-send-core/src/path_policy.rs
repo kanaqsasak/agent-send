@@ -229,6 +229,30 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_relative_path_matrix_rejects_every_traversal() {
+        // This fixed matrix is property-style coverage without a random test
+        // seed: every generated path containing `..` must be rejected, while
+        // all-safe combinations remain valid across supported platforms.
+        let components = ["safe", "nested", ".", ".."];
+        for first in components {
+            for second in components {
+                for third in components {
+                    let path = PathBuf::from(first).join(second).join(third);
+                    let result = PathPolicy::validate_relative(&path);
+                    if [first, second, third].contains(&"..") {
+                        assert_eq!(result, Err(PathPolicyError::Traversal), "{path:?}");
+                    } else {
+                        assert!(result.is_ok(), "{path:?}: {result:?}");
+                    }
+                }
+            }
+        }
+        for path in [PathBuf::from("../secret"), PathBuf::from("safe\0secret")] {
+            assert!(PathPolicy::validate_relative(&path).is_err(), "{path:?}");
+        }
+    }
+
+    #[test]
     fn rejects_unsupported_directions() {
         let root = TestRoot::new();
         fs::write(root.0.join("file"), b"ok").unwrap();

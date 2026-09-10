@@ -41,11 +41,11 @@ pub use peer_transport::{
     send_socket_transfer, EncryptedPeerFrame, MockPeerTransport, PairedPeer, PairingSecret,
     PeerChannelError, PeerConnection, PeerConnectionError, PeerMessage, PeerTransport,
     PeerTransportError, SecurePeerChannel, SocketPeerTransport, SocketTransferError,
-    PEER_PROTOCOL_VERSION,
+    PEER_CONNECT_TIMEOUT, PEER_IO_TIMEOUT, PEER_PROTOCOL_VERSION,
 };
 pub use transfer::{
     Cancellation, LoopbackTransport, TransferEngine, TransferError, TransferOutcome,
-    TransferProgress, CHUNK_SIZE,
+    TransferProgress, CHUNK_SIZE, MAX_TRANSFER_BYTES, MAX_TRANSFER_FILES,
 };
 
 pub const API_VERSION: u32 = 1;
@@ -897,8 +897,8 @@ fn handle_peer_connection(
     if stream.set_nonblocking(false).is_err() {
         return;
     }
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(peer_transport::PEER_IO_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(peer_transport::PEER_IO_TIMEOUT));
     let mut transport = SocketPeerTransport::from_stream(stream);
     let Ok(Some(first_frame)) = transport.receive() else {
         return;

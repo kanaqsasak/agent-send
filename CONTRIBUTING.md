@@ -31,6 +31,10 @@ writes outside the configured root. Do not add an inbound internet listener.
 
 When reporting a transfer, include enough context to audit the actor, peer,
 capability, result, and timestamp without logging file contents or secrets.
+Audit metadata must redact request-controlled identifiers and normalize unknown
+operations rather than preserve arbitrary input. Review [the threat model](docs/THREAT_MODEL.md)
+and [release readiness](docs/RELEASE_READINESS.md) when changing a security or
+release claim.
 
 ## Pull requests
 

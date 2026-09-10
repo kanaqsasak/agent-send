@@ -39,6 +39,9 @@ Build and run the deterministic local transfer demo:
 ```sh
 cargo build -p agent-send-cli
 cargo run -p agent-send-cli -- demo
+
+# Local-only throughput and idle wall-clock measurement (not a CPU benchmark)
+cargo run -p agent-send-daemon --example measure
 ```
 
 Run the background daemon locally (its config is read from
@@ -57,7 +60,7 @@ cargo run -p agent-send-daemon -- --identity-path /tmp/agent-send-dev.json --hid
 cargo run -p agent-send-cli -- health --addr 127.0.0.1:8123
 ```
 
-The local automation API accepts only loopback addresses; stop the daemon with Ctrl-C. The daemon also starts a separate paired-peer TCP listener on `0.0.0.0:8742` by default. It never exposes the automation API on that listener. The desktop app will be added after the core protocol and security boundaries are validated.
+The local automation API accepts only loopback addresses; stop the daemon with Ctrl-C. The daemon also starts a separate paired-peer TCP listener on `0.0.0.0:8742` by default. It never exposes the automation API on that listener. The desktop app will be added after the core protocol and security boundaries are validated. See [the threat model](docs/THREAT_MODEL.md) and [release readiness](docs/RELEASE_READINESS.md) for verified test coverage and explicit unverified claims.
 
 ## LAN networking and pairing
 

@@ -23,7 +23,12 @@ use std::{
 };
 use thiserror::Error;
 
+/// Maximum plaintext payload in one peer frame.
 pub const CHUNK_SIZE: usize = 64 * 1024;
+/// Maximum bytes accepted for one transfer before any file is created.
+pub const MAX_TRANSFER_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Maximum files (and total filesystem entries) accepted in one transfer.
+pub const MAX_TRANSFER_FILES: u64 = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferProgress {
@@ -56,6 +61,10 @@ pub enum TransferError {
     Protocol(&'static str),
     #[error("peer transfer byte count did not match its manifest")]
     SizeMismatch,
+    #[error("transfer exceeds the {MAX_TRANSFER_BYTES}-byte size limit")]
+    SizeLimitExceeded,
+    #[error("transfer exceeds the {MAX_TRANSFER_FILES}-file limit")]
+    FileCountLimitExceeded,
     #[error("peer transfer hash did not match its manifest")]
     HashMismatch,
 }
@@ -139,7 +148,8 @@ impl TransferEngine {
             let path = source.resolve(&relative, PathOperation::Read)?;
             collect_items(&source, &path, &relative, &mut items)?;
         }
-        let total_bytes = items.iter().map(|item| item.size).sum();
+        let total_bytes = transfer_total_bytes(&items)?;
+        enforce_transfer_limits(&items, total_bytes)?;
         let sha256 = hash_items(&items)?;
         Ok(PreparedTransfer {
             transfer_id: request.idempotency_key.clone(),
@@ -168,6 +178,9 @@ impl TransferEngine {
         {
             return Ok(IncomingStart::Completed(outcome));
         }
+        if total_bytes > MAX_TRANSFER_BYTES {
+            return Err(TransferError::SizeLimitExceeded);
+        }
         let destination = self.folder(&destination_folder_id)?;
         // Check the named capability and its write direction before telling a
         // remote peer that it may send any file content.
@@ -183,6 +196,8 @@ impl TransferEngine {
             files: 0,
             hash: Sha256::new(),
             active_file: None,
+            files_started: 0,
+            entries: 0,
             targets: BTreeSet::new(),
             committed_targets: Vec::new(),
             completed: false,
@@ -225,7 +240,8 @@ impl TransferEngine {
             let path = source.resolve(&relative, PathOperation::Read)?;
             collect_items(source, &path, &relative, &mut items)?;
         }
-        let total = items.iter().map(|i| i.size).sum();
+        let total = transfer_total_bytes(&items)?;
+        enforce_transfer_limits(&items, total)?;
         let mut bytes = 0;
         let mut files = 0;
         let mut hash = Sha256::new();
@@ -388,6 +404,8 @@ pub(crate) struct IncomingTransfer {
     files: u64,
     hash: Sha256,
     active_file: Option<IncomingFile>,
+    files_started: u64,
+    entries: u64,
     targets: BTreeSet<PathBuf>,
     committed_targets: Vec<PathBuf>,
     completed: bool,
@@ -413,6 +431,7 @@ impl IncomingTransfer {
                 "directory arrived while a file is open",
             ));
         }
+        self.reserve_entry()?;
         let target = self.destination.resolve(relative, PathOperation::Write)?;
         if target.exists() && !target.is_dir() {
             return Err(TransferError::DestinationExists(target));
@@ -433,6 +452,10 @@ impl IncomingTransfer {
                 "file started while another file is open",
             ));
         }
+        if size > self.total_bytes.saturating_sub(self.bytes) {
+            return Err(TransferError::SizeMismatch);
+        }
+        self.reserve_file()?;
         let target = self.destination.resolve(relative, PathOperation::Write)?;
         if target.exists() || !self.targets.insert(target.clone()) {
             return Err(TransferError::DestinationExists(target));
@@ -534,6 +557,23 @@ impl IncomingTransfer {
         Ok(outcome)
     }
 
+    fn reserve_file(&mut self) -> Result<(), TransferError> {
+        if self.files_started >= MAX_TRANSFER_FILES {
+            return Err(TransferError::FileCountLimitExceeded);
+        }
+        self.reserve_entry()?;
+        self.files_started += 1;
+        Ok(())
+    }
+
+    fn reserve_entry(&mut self) -> Result<(), TransferError> {
+        if self.entries >= MAX_TRANSFER_FILES {
+            return Err(TransferError::FileCountLimitExceeded);
+        }
+        self.entries += 1;
+        Ok(())
+    }
+
     fn require_id(&self, transfer_id: &str) -> Result<(), TransferError> {
         if self.transfer_id == transfer_id {
             Ok(())
@@ -622,6 +662,26 @@ fn collect_items(
         relative: relative.to_owned(),
         size: 0,
     });
+    Ok(())
+}
+
+fn transfer_total_bytes(items: &[FileItem]) -> Result<u64, TransferError> {
+    items.iter().try_fold(0u64, |total, item| {
+        total
+            .checked_add(item.size)
+            .ok_or(TransferError::SizeLimitExceeded)
+    })
+}
+
+fn enforce_transfer_limits(items: &[FileItem], total_bytes: u64) -> Result<(), TransferError> {
+    if total_bytes > MAX_TRANSFER_BYTES {
+        return Err(TransferError::SizeLimitExceeded);
+    }
+    if items.len() as u64 > MAX_TRANSFER_FILES
+        || items.iter().filter(|item| item.source.is_file()).count() as u64 > MAX_TRANSFER_FILES
+    {
+        return Err(TransferError::FileCountLimitExceeded);
+    }
     Ok(())
 }
 
@@ -758,6 +818,75 @@ mod tests {
         let _ = fs::remove_dir_all(a);
         let _ = fs::remove_dir_all(b);
     }
+    #[test]
+    fn transfer_limits_reject_oversized_and_too_many_files_before_writes() {
+        let oversized = vec![FileItem {
+            source: PathBuf::from("not-opened"),
+            relative: PathBuf::from("not-opened"),
+            size: MAX_TRANSFER_BYTES + 1,
+        }];
+        assert!(matches!(
+            enforce_transfer_limits(&oversized, MAX_TRANSFER_BYTES + 1),
+            Err(TransferError::SizeLimitExceeded)
+        ));
+
+        let too_many = (0..=MAX_TRANSFER_FILES)
+            .map(|index| FileItem {
+                source: PathBuf::from(format!("file-{index}")),
+                relative: PathBuf::from(format!("file-{index}")),
+                size: 0,
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            enforce_transfer_limits(&too_many, 0),
+            Err(TransferError::FileCountLimitExceeded)
+        ));
+    }
+
+    #[test]
+    fn incoming_transfer_enforces_declared_size_and_file_count() {
+        let root = root("limits");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let engine = Arc::new(TransferEngine::new());
+        engine.add_folder(
+            "in",
+            PathPolicy::new(&root, agent_send_core::FolderDirection::Write),
+        );
+        assert!(matches!(
+            engine.begin_incoming(
+                "size".into(),
+                "in".into(),
+                "size".into(),
+                MAX_TRANSFER_BYTES + 1,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            ),
+            Err(TransferError::SizeLimitExceeded)
+        ));
+        let IncomingStart::Ready(mut incoming) = engine
+            .begin_incoming(
+                "files".into(),
+                "in".into(),
+                "files".into(),
+                0,
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".into(),
+            )
+            .unwrap()
+        else {
+            panic!("new transfer must be ready");
+        };
+        incoming.files_started = MAX_TRANSFER_FILES;
+        assert!(matches!(
+            incoming.file_start("files", "one-too-many", 0),
+            Err(TransferError::FileCountLimitExceeded)
+        ));
+        assert!(matches!(
+            incoming.file_start("files", "larger-than-manifest", 1),
+            Err(TransferError::SizeMismatch)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn denied_destination_and_cancellation_are_safe() {
         let a = root("c");

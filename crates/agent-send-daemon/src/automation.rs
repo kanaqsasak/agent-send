@@ -377,6 +377,8 @@ fn authorize_submission(
     Ok(())
 }
 
+/// Audit metadata intentionally stores stable redacted identifiers rather
+/// than request-provided capability, peer, transfer, or actor values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditEntry {
     pub timestamp_ms: u128,
@@ -406,17 +408,42 @@ impl AuditLog {
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis(),
-            actor_id: actor_id.into(),
-            operation: operation.into(),
-            peer_id,
-            folder_ids,
-            transfer_id,
-            result: result.into(),
+            actor_id: redact_audit_identifier(actor_id.into()),
+            operation: audit_operation(operation.into()),
+            peer_id: peer_id.map(redact_audit_identifier),
+            folder_ids: folder_ids
+                .into_iter()
+                .map(redact_audit_identifier)
+                .collect(),
+            transfer_id: transfer_id.map(redact_audit_identifier),
+            result: audit_result(result.into()),
         });
     }
 
     pub fn entries(&self) -> Vec<AuditEntry> {
         self.0.lock().unwrap().clone()
+    }
+}
+
+fn redact_audit_identifier(value: String) -> String {
+    // A deterministic digest supports correlating related audit records without
+    // retaining caller-controlled identifiers that may contain a token, path,
+    // pairing secret, or other sensitive text.
+    format!("redacted:{}", hash(&value))
+}
+
+fn audit_operation(operation: String) -> String {
+    match operation.as_str() {
+        "peers.list" | "folders.list" | "transfers.submit" | "transfers.send"
+        | "transfers.status" | "transfers.cancel" | "invalid_request" => operation,
+        _ => "unknown".into(),
+    }
+}
+
+fn audit_result(result: String) -> String {
+    match result.as_str() {
+        "ok" | "denied" => result,
+        _ => "unknown".into(),
     }
 }
 
@@ -544,9 +571,35 @@ mod tests {
             "denied",
         );
         let entry = audit.entries().pop().unwrap();
-        assert_eq!(entry.actor_id, "agent-id");
+        assert!(entry.actor_id.starts_with("redacted:"));
         assert!(!serde_json::to_string(&entry)
             .unwrap()
             .contains("agent_secret"));
+    }
+
+    #[test]
+    fn audit_redacts_request_controlled_identifiers_and_unknown_operations() {
+        let audit = AuditLog::default();
+        let secret = format!("agent_{}", "ab".repeat(32));
+        audit.record(
+            secret.clone(),
+            secret.clone(),
+            Some("peer-secret".into()),
+            vec!["folder-secret".into()],
+            Some("transfer-secret".into()),
+            secret.clone(),
+        );
+        let entry = audit.entries().pop().unwrap();
+        let serialized = serde_json::to_string(&entry).unwrap();
+        for value in [
+            secret.as_str(),
+            "peer-secret",
+            "folder-secret",
+            "transfer-secret",
+        ] {
+            assert!(!serialized.contains(value), "audit leaked {value}");
+        }
+        assert_eq!(entry.operation, "unknown");
+        assert_eq!(entry.result, "unknown");
     }
 }

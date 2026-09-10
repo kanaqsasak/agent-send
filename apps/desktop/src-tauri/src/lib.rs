@@ -8,7 +8,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, RunEvent,
+    Manager, PhysicalPosition, Position, RunEvent, Size,
 };
 
 const HIDDEN_FLAG: &str = "--hidden";
@@ -32,14 +32,19 @@ fn daemon_endpoint() -> String {
 
 fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
     let directories = [resource_dir.to_path_buf(), resource_dir.join("binaries")];
-    directories.iter().filter_map(|dir| fs::read_dir(dir).ok()).flat_map(|entries| {
-        entries.filter_map(Result::ok).map(|entry| entry.path())
-    }).find(|path| {
-        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-            name.starts_with("agent-send-daemon-")
-                && (cfg!(windows) && name.ends_with(".exe") || !cfg!(windows) && !name.ends_with(".exe"))
+    directories
+        .iter()
+        .filter_map(|dir| fs::read_dir(dir).ok())
+        .flat_map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()))
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("agent-send-daemon-")
+                        && (cfg!(windows) && name.ends_with(".exe")
+                            || !cfg!(windows) && !name.ends_with(".exe"))
+                })
         })
-    })
 }
 
 fn start_daemon(app: &tauri::AppHandle) {
@@ -53,7 +58,11 @@ fn start_daemon(app: &tauri::AppHandle) {
     let path = daemon_path(&resource_dir).or_else(|| {
         // In development, staged sidecars live beside this crate rather than
         // in Tauri's packaged resource directory.
-        daemon_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").as_path())
+        daemon_path(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("binaries")
+                .as_path(),
+        )
     });
     let Some(path) = path else {
         eprintln!("agent-send: bundled daemon not found; use the documented development daemon");
@@ -103,17 +112,20 @@ pub fn run() {
             let menu = Menu::with_items(app, &[&show, &hide, &quit])?;
 
             TrayIconBuilder::new()
-                .icon(tauri::image::Image::from_bytes(include_bytes!("../icons/32x32.png"))?)
+                .icon(tauri::image::Image::from_bytes(include_bytes!(
+                    "../icons/32x32.png"
+                ))?)
                 .menu(&menu)
                 .tooltip("agent-send")
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
                         button: MouseButton::Left,
                         button_state: MouseButtonState::Up,
+                        rect,
                         ..
                     } = event
                     {
-                        show_window(tray.app_handle());
+                        show_window_at(tray.app_handle(), rect);
                     }
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
@@ -143,6 +155,26 @@ pub fn run() {
 
 fn show_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn show_window_at(app: &tauri::AppHandle, rect: tauri::Rect) {
+    if let Some(window) = app.get_webview_window("main") {
+        // Position the popover below the tray icon. This keeps the interaction
+        // anchored to the tray on menu-bar systems; the UI remains usable on
+        // platforms where tray geometry is unavailable.
+        let (x, y) = match (rect.position, rect.size) {
+            (Position::Physical(position), Size::Physical(size)) => {
+                (position.x - 330, position.y + size.height as i32 + 8)
+            }
+            _ => {
+                show_window(app);
+                return;
+            }
+        };
+        let _ = window.set_position(PhysicalPosition::new(x, y));
         let _ = window.show();
         let _ = window.set_focus();
     }

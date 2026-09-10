@@ -16,6 +16,9 @@
         "width": 360,
         "height": 240,
         "resizable": false,
+        "decorations": false,
+        "shadow": true,
+        "alwaysOnTop": true,
         "visible": false,
         "center": true
       }

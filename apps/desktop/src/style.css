@@ -4,9 +4,13 @@
   background: #f7f8fa;
 }
 * { box-sizing: border-box; }
-body { margin: 0; }
-.shell { max-width: 680px; margin: auto; padding: 28px 30px 42px; }
-header { display: flex; align-items: center; gap: 9px; }
+body { margin: 0; background: transparent; }
+.shell { max-width: 680px; margin: auto; padding: 18px 20px 24px; background: #f7f8fa; border: 1px solid #dfe3e8; border-radius: 14px; min-height: 100vh; }
+header { display: flex; align-items: center; gap: 9px; min-height: 28px; user-select: none; cursor: default; }
+.window-controls { display: flex; gap: 3px; margin-left: auto; }
+.window-controls button { border: 0; background: transparent; color: #69717d; width: 27px; height: 27px; padding: 0; font-size: 19px; line-height: 1; }
+.window-controls button:hover { background: #e3e7ed; color: #20242a; }
+.window-controls button:last-child:hover { background: #f2cccc; color: #a63131; }
 h1 { margin: 0; font-size: 21px; letter-spacing: -0.02em; }
 h2 { margin: 0; font-size: 16px; }
 .mark { color: #3478f6; font-size: 18px; }

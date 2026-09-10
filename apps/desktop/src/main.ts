@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { enable as enableAutostart } from "@tauri-apps/plugin-autostart";
 import "./style.css";
 
@@ -62,7 +63,7 @@ const daemon: DaemonClient = {
 const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <section class="shell">
-    <header><span class="mark" aria-hidden="true">●</span><h1>agent-send</h1></header>
+    <header data-tauri-drag-region><span class="mark" aria-hidden="true">●</span><h1>agent-send</h1><nav class="window-controls" aria-label="Window controls"><button id="hide-window" type="button" title="Hide window" aria-label="Hide window">—</button><button id="close-window" type="button" title="Hide to tray" aria-label="Hide to tray">×</button></nav></header>
     <p class="subtitle">Private local file transfer</p>
     <div class="health" aria-live="polite"><span class="dot pending"></span><span id="status">Connecting…</span></div>
     <p class="endpoint" id="endpoint"></p>
@@ -89,6 +90,9 @@ const peersElement = document.querySelector<HTMLDivElement>("#peers")!;
 const errorElement = document.querySelector<HTMLParagraphElement>("#error")!;
 const pairingElement = document.querySelector<HTMLDivElement>("#pairing")!;
 const dot = document.querySelector<HTMLSpanElement>(".dot")!;
+const nativeWindow = getCurrentWindow();
+document.querySelector("#hide-window")?.addEventListener("click", () => void nativeWindow.hide());
+document.querySelector("#close-window")?.addEventListener("click", () => void nativeWindow.hide());
 let currentPeers: Peer[] = [];
 
 function showError(message: string) { errorElement.textContent = message; errorElement.hidden = false; }

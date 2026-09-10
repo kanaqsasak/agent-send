@@ -1,15 +1,13 @@
 name: Package desktop
 
-on:
-  workflow_dispatch:
-  push:
-    tags: ["v*"]
+on: [push, workflow_dispatch]
 
 permissions:
   contents: read
 
 jobs:
   bundle:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')
     name: ${{ matrix.platform }} bundle
     runs-on: ${{ matrix.os }}
     strategy:

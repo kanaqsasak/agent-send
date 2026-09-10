@@ -16,7 +16,7 @@
         "width": 360,
         "height": 240,
         "resizable": false,
-        "visible": true,
+        "visible": false,
         "center": true
       }
     ],
@@ -24,8 +24,20 @@
   },
   "bundle": {
     "active": true,
-    "targets": "all",
+    "targets": ["dmg", "app", "msi", "nsis", "deb", "rpm", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ],
     "category": "Utility",
-    "shortDescription": "Private local file transfer"
+    "shortDescription": "Private local file transfer",
+    "longDescription": "A private, local-first file transfer tray service.",
+    "linux": {
+      "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] }
+    },
+    "windows": {
+      "nsis": { "installMode": "currentUser" }
+    }
   }
 }

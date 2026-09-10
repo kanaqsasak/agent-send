@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { enable as enableAutostart } from "@tauri-apps/plugin-autostart";
 import "./style.css";
 
 type Health = { version: number; status: "ok"; identity_id: string };
@@ -6,6 +7,17 @@ type Health = { version: number; status: "ok"; identity_id: string };
 interface DaemonClient {
   endpoint(): Promise<string>;
   health(): Promise<Health>;
+}
+
+// Login startup is enabled for the per-user shell. The Rust plugin adds
+// --hidden, so this does not open a window after login.
+async function configureAutostart() {
+  try {
+    await enableAutostart();
+  } catch {
+    // Browser development and platforms without an autostart backend can
+    // still use the shell; packaging limitations are documented in README.
+  }
 }
 
 const daemon: DaemonClient = {
@@ -58,5 +70,6 @@ async function checkHealth() {
 }
 
 document.querySelector("#retry")!.addEventListener("click", checkHealth);
+void configureAutostart();
 void checkHealth();
 setInterval(checkHealth, 10_000);

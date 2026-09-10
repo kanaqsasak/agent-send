@@ -5,15 +5,36 @@
 }
 * { box-sizing: border-box; }
 body { margin: 0; }
-.shell { padding: 28px 30px; }
+.shell { max-width: 680px; margin: auto; padding: 28px 30px 42px; }
 header { display: flex; align-items: center; gap: 9px; }
 h1 { margin: 0; font-size: 21px; letter-spacing: -0.02em; }
+h2 { margin: 0; font-size: 16px; }
 .mark { color: #3478f6; font-size: 18px; }
-.subtitle { color: #69717d; margin: 4px 0 25px 27px; }
+.subtitle { color: #69717d; margin: 4px 0 20px 27px; }
 .health { display: flex; align-items: center; gap: 9px; font-weight: 600; }
 .dot { width: 9px; height: 9px; border-radius: 50%; background: #aab1bb; }
 .dot.online { background: #2aa66f; }
 .dot.offline { background: #d45151; }
-.endpoint { color: #69717d; font: 12px ui-monospace, monospace; margin: 9px 0 20px 18px; }
-button { border: 1px solid #d5d9df; border-radius: 6px; background: white; color: #20242a; padding: 7px 12px; cursor: pointer; }
+.endpoint, .muted { color: #69717d; }
+.endpoint { font: 12px ui-monospace, monospace; margin: 8px 0 18px 18px; }
+.panel, .pairing { background: white; border: 1px solid #e1e4e9; border-radius: 9px; padding: 17px; margin-top: 14px; }
+.identity-panel p { margin: 3px 0 9px; }
+code { user-select: all; color: #36404d; font-size: 13px; overflow-wrap: anywhere; }
+.section-heading { display: flex; justify-content: space-between; align-items: start; gap: 12px; }
+.section-heading p { margin: 3px 0 0; }
+.peers { margin-top: 14px; }
+.peer { display: flex; align-items: center; gap: 10px; border-top: 1px solid #edf0f3; padding: 12px 0; }
+.peer > div { flex: 1; min-width: 0; }
+.peer strong, .peer small { display: block; overflow-wrap: anywhere; }
+.peer small { color: #69717d; margin-top: 2px; }
+.trust { color: #238358; font-size: 12px; font-weight: 600; }
+button { border: 1px solid #d5d9df; border-radius: 6px; background: white; color: #20242a; padding: 7px 12px; cursor: pointer; white-space: nowrap; }
 button:hover { border-color: #3478f6; }
+button:disabled { opacity: .55; cursor: wait; }
+button.secondary { color: #59616c; }
+.error { border-radius: 6px; background: #fff0f0; color: #a63131; padding: 9px 11px; margin: 12px 0 0; }
+.pairing { border-color: #b9d0ff; background: #f7faff; }
+.pairing p { margin: 7px 0; }
+.pairing .code { display: block; letter-spacing: .16em; font-size: 28px; margin: 14px 0 4px; }
+.pairing input { display: block; width: 150px; border: 1px solid #cbd1da; border-radius: 6px; padding: 8px; margin: 12px 0; font: inherit; }
+.pairing button { margin-right: 8px; }

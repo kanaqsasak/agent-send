@@ -2,8 +2,17 @@
 
 This is the first Tauri 2 desktop shell. It deliberately stays a thin client:
 the Rust daemon remains a separate per-user process and owns health, transfers,
-and filesystem access. The shell polls `GET /v1/health` and exposes show/hide/quit
-from its tray menu. Closing the window hides it without stopping the daemon.
+and filesystem access. The shell polls `GET /v1/health` and `GET /v1/peers`, displaying this device's
+identity, discovered peers, and their trust state. Unknown peers can be paired
+with a short-code confirmation; trusted peers can be revoked. Pairing and peer
+list failures are shown inline and loading states are explicit. Closing the
+window hides it without stopping the daemon.
+
+The frontend only retains the short code and peer metadata needed for the
+current view. It intentionally discards the daemon's `pairing_secret` response:
+secrets and bearer tokens are never displayed, logged, or written to browser
+storage. The daemon remains responsible for secret storage and authenticated
+peer traffic.
 
 ## Development
 

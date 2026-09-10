@@ -139,12 +139,19 @@ pub fn run() {
                 .build(app)?;
             Ok(())
         })
-        .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+        .on_window_event(|window, event| match event {
+            tauri::WindowEvent::Focused(false) if !window.is_focused().unwrap_or(false) => {
+                // A popover is transient: losing focus returns it to the tray.
+                // Re-check focus so a delayed blur from a tray click cannot hide
+                // a popover that has already been reopened and focused.
+                let _ = window.hide();
+            }
+            tauri::WindowEvent::CloseRequested { api, .. } => {
                 // Closing the small shell must not stop the daemon or transfers.
                 api.prevent_close();
                 let _ = window.hide();
             }
+            _ => {}
         })
         .build(tauri::generate_context!())
         .expect("error while building agent-send desktop shell")
@@ -188,8 +195,10 @@ fn show_window_at(app: &tauri::AppHandle, rect: tauri::Rect) {
         // monitor work area, preferring the side opposite the tray if needed.
         if let Ok(Some(monitor)) = app.monitor_from_point(position.x as f64, position.y as f64) {
             let work_area = monitor.work_area();
-            let right = work_area.position.x + i32::try_from(work_area.size.width).unwrap_or(i32::MAX);
-            let bottom = work_area.position.y + i32::try_from(work_area.size.height).unwrap_or(i32::MAX);
+            let right =
+                work_area.position.x + i32::try_from(work_area.size.width).unwrap_or(i32::MAX);
+            let bottom =
+                work_area.position.y + i32::try_from(work_area.size.height).unwrap_or(i32::MAX);
             x = x.clamp(work_area.position.x, right.saturating_sub(width));
             if y.saturating_add(height) > bottom {
                 y = position.y.saturating_sub(height + 8);

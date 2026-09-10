@@ -19,8 +19,7 @@
         "decorations": false,
         "shadow": true,
         "alwaysOnTop": true,
-        "visible": false,
-        "center": true
+        "visible": false
       }
     ],
     "security": { "csp": null }

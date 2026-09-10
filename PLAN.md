@@ -29,7 +29,7 @@ humans, while exposing a safe local API/CLI/MCP surface for AI agents.
 - [x] Initial architecture and security boundary documentation.
 - [x] Add contribution instructions and CI.
 
-### M1 — Daemon skeleton
+### M1 — Daemon skeleton (implemented; cross-platform runtime still unverified)
 
 - Add a Rust daemon crate with structured configuration and graceful shutdown.
   Local development run commands are documented in `README.md`; use
@@ -42,7 +42,7 @@ humans, while exposing a safe local API/CLI/MCP surface for AI agents.
 **Exit:** daemon starts/stops deterministically, health endpoint works locally, and
 folder policy tests cover allowed, traversal, and escape cases.
 
-### M2 — Peer discovery and trust
+### M2 — Peer discovery and trust (implemented; physical-LAN validation still unverified)
 
 - Implement mDNS discovery and manual peer entry.
 - Define peer identity and pairing flow with a visible short code.
@@ -51,7 +51,7 @@ folder policy tests cover allowed, traversal, and escape cases.
 
 **Exit:** two local daemon instances can discover, pair, list, and revoke each other.
 
-### M3 — Transfers
+### M3 — Transfers (implemented; physical-LAN soak testing still unverified)
 
 - Implement versioned control handshake and encrypted streamed file transfer.
 - Preserve directory-relative paths and reject unsafe archive/path names.
@@ -61,7 +61,7 @@ folder policy tests cover allowed, traversal, and escape cases.
 **Exit:** files and directories transfer reliably between paired peers, including
 large files, cancellation, retry, and destination capability enforcement.
 
-### M4 — Desktop shell and installation
+### M4 — Desktop shell and installation (implemented; target-host installers still unverified)
 
 - Add Tauri 2 desktop shell with Svelte/TypeScript UI.
 - Add tray menu, notifications, settings, transfer status, and peer/folder views.
@@ -71,7 +71,7 @@ large files, cancellation, retry, and destination capability enforcement.
 **Exit:** a fresh user can install, pair, send/receive, configure folders, and run
 headlessly after login.
 
-### M5 — Agent interfaces
+### M5 — Agent interfaces (implemented; production integration review still pending)
 
 - Stabilize local API and ship `agent-send` CLI.
 - Add optional MCP adapter exposing peers, folders, send, status, cancel, and events.
@@ -81,7 +81,7 @@ headlessly after login.
 **Exit:** an agent can send a file to a named peer/folder without receiving raw
 filesystem authority or requiring UI automation.
 
-### M6 — Hardening and performance
+### M6 — Hardening and performance (partial; release validation remains)
 
 - Benchmark throughput, memory, idle CPU, startup, and discovery latency.
 - Evaluate QUIC versus HTTPS without weakening policy or interoperability.

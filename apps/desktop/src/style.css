@@ -66,10 +66,8 @@ button:focus-visible, input:focus-visible {
   border-radius: 5px;
   background: var(--accent-subtle);
   color: var(--accent);
-  font-size: 15px;
-  font-weight: 700;
-  line-height: 1;
 }
+.app-mark svg { display: block; width: 16px; height: 16px; }
 .app-name { color: var(--text); font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .titlebar-actions { display: flex; margin-left: auto; }
 

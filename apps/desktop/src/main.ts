@@ -63,7 +63,7 @@ const app = document.querySelector<HTMLDivElement>("#app")!;
 app.innerHTML = `
   <section class="popover-shell" aria-label="agent-send">
     <header class="titlebar" data-tauri-drag-region>
-      <span class="app-mark" aria-hidden="true">↗</span>
+      <span class="app-mark" aria-hidden="true"><svg viewBox="0 0 32 32" focusable="false"><g fill="none" stroke="currentColor" stroke-width="2.35" stroke-linecap="round" stroke-linejoin="round"><path d="M10.5 21.5 19.25 12.75"/><path d="M10.5 15.5A6 6 0 0 1 16.5 21.5M10.5 9.5A12 12 0 0 1 22.5 21.5"/></g><circle cx="10.5" cy="21.5" r="2.5" fill="currentColor"/></svg></span>
       <span class="app-name">agent-send</span>
     </header>
 

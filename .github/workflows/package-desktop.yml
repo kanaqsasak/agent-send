@@ -91,12 +91,33 @@ jobs:
           Copy-Item ../../target/release/agent-send-daemon.exe "src-tauri/binaries/agent-send-daemon-$target.exe"
           Copy-Item ../../target/release/agent-send-cli.exe "src-tauri/binaries/agent-send-cli-$target.exe"
           Copy-Item ../../target/release/agent-send-mcp.exe "src-tauri/binaries/agent-send-mcp-$target.exe"
+      - name: Report release signing configuration
+        working-directory: apps/desktop
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: node -e 'const names = ["APPLE_CERTIFICATE","APPLE_CERTIFICATE_PASSWORD","APPLE_SIGNING_IDENTITY","APPLE_ID","APPLE_PASSWORD","APPLE_TEAM_ID","WINDOWS_CERTIFICATE","WINDOWS_CERTIFICATE_PASSWORD","TAURI_SIGNING_PRIVATE_KEY","TAURI_SIGNING_PRIVATE_KEY_PASSWORD"]; for (const name of names) console.log(name + "=" + (process.env[name] ? "configured" : "not configured"))'
       - name: Build Tauri bundles
         working-directory: apps/desktop
         run: npm run tauri:build -- --bundles ${{ matrix.bundles }}
-      - name: Upload versioned bundles
+      - name: Create checksums and release manifest
+        working-directory: apps/desktop
+        run: npm run release:manifest
+      - name: Upload versioned bundles and release metadata
         uses: actions/upload-artifact@v4
         with:
           name: agent-send-${{ steps.version.outputs.version }}-${{ matrix.platform }}-${{ runner.arch }}
-          path: apps/desktop/src-tauri/target/release/bundle/
+          path: |
+            apps/desktop/src-tauri/target/release/bundle/
+            apps/desktop/release/SHA256SUMS.txt
+            apps/desktop/release/release-manifest.json
           if-no-files-found: error
+          retention-days: 30

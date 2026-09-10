@@ -82,7 +82,9 @@ a separately started daemon when no sidecar has been staged.
 The packaging workflow performs this staging and names uploaded artifacts with
 the app version, platform, and runner architecture. It never commits staged
 binaries. Local `tauri:build` requires the three staged files; `npm run build`
-does not.
+does not. CI also uploads `SHA256SUMS.txt` and `release-manifest.json` beside
+the bundles; verify the checksums before installing a downloaded artifact.
+Artifacts are retained for 30 days.
 
 ### Signing and notarization
 
@@ -91,10 +93,12 @@ secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
 `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`,
 `WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`, and
 `TAURI_SIGNING_PRIVATE_KEY`/`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for future
-update artifacts. Configure them in GitHub Actions before publishing; builds
-without them remain unsigned. Never put certificates, private keys, or Apple
-credentials in this repository. Linux artifacts are not signed by this
-workflow.
+update artifacts. Configure them in GitHub Actions before publishing; builds without them
+remain unsigned. The values are passed only through the job environment; CI
+reports configured/not-configured status without printing values. Never put
+certificates, private keys, or Apple credentials in this repository. Linux
+artifacts are not signed by this workflow. See [the release checklist](../../docs/RELEASE_READINESS.md)
+for installer, uninstall, firewall, sleep/wake, and rollback evidence.
 
 The checked-in PNGs under `src-tauri/icons` are functional placeholder branding
 and must be replaced before a public release. Firewall prompts, update feeds, and

@@ -18,10 +18,29 @@ The measurement harness reports one local run. It does **not** measure idle CPU,
 memory, battery use, startup distribution, or cross-host throughput; no baseline
 or release performance threshold has been verified.
 
+## Packaging automation
+
+`.github/workflows/package-desktop.yml` builds native bundles through a platform
+matrix: macOS produces `.app`/`.dmg`, Windows produces NSIS/MSI, and Ubuntu
+produces AppImage/DEB/RPM. Each job uploads versioned artifacts with a 30-day
+retention period plus `SHA256SUMS.txt` and `release-manifest.json`. Verify the
+checksum file on the downloaded artifact before testing or publishing it.
+
+The workflow wires, without storing values in the repository, the optional
+macOS certificate/password, signing identity, Apple ID/app-specific password,
+and team ID, Windows certificate/password, and Tauri updater key/password
+secrets. Tauri consumes the platform signing values during bundling; Apple
+notarization requires all Apple identity values and a notarization-capable
+certificate. Missing values intentionally produce unsigned artifacts and are
+reported without printing secret contents. Linux packages are not signed by
+this workflow. The updater key is wired for future update artifacts and does
+not claim an update channel exists.
+
 ## Explicitly unverified or incomplete
 
 - Signed installers, reproducible builds, provenance, SBOMs, and an update
-  strategy are not implemented or verified.
+  strategy are not implemented or verified; the workflow's optional signing
+  wiring does not turn these into release claims.
 - macOS, Windows, and Linux packaging, code signing, firewall prompts,
   accessibility, localization, sleep/wake, and network transitions have not
   been verified by this repository's tests.
@@ -31,6 +50,27 @@ or release performance threshold has been verified.
   not encrypt secrets at rest.
 - Transfer limits do not replace global rate limiting, quota management, or
   operational monitoring.
+
+## Release checklist (manual, per supported platform)
+
+For every candidate artifact, record the OS version, architecture, artifact
+name, checksum, tester, and result. Do not mark a platform complete based only
+on the GitHub runner build; platform testing is not performed in this checkout.
+
+- [ ] Download the expected installer and verify `SHA256SUMS.txt`.
+- [ ] Install on a clean user account; confirm the app launches, tray behavior
+      works, and the bundled daemon/CLI/MCP sidecars are present.
+- [ ] Confirm per-user login startup and a hidden launch; repeat after reboot.
+- [ ] Uninstall through the platform installer, confirm the startup registration
+      is removed, and verify the documented user-data retention behavior.
+- [ ] Exercise firewall prompts: allow trusted-LAN discovery and TCP 8742,
+      reject/inspect unexpected network access, and confirm loopback API scope.
+- [ ] Start a transfer, sleep/wake the machine, change network connectivity,
+      and verify failure/retry behavior without corrupting the destination.
+- [ ] Test rollback by installing the previous known-good artifact after the
+      candidate, then restore the candidate; preserve both logs and checksums.
+- [ ] Record signing and macOS notarization results where credentials are
+      configured. Never publish an unsigned artifact as a signed release.
 
 ## Release gate before a production claim
 
@@ -42,8 +82,8 @@ or release performance threshold has been verified.
    parsing; resolve findings.
 4. Implement and verify signing, update, rollback, provenance/SBOM, and secure
    platform credential storage.
-5. Validate installers, firewall behavior, accessibility, localization, and
-   lifecycle behavior on macOS, Windows, and Linux.
+5. Complete the checklist above for macOS, Windows, and Linux, including
+   installer, uninstall, firewall, sleep/wake, and rollback evidence.
 
 These gates preserve the existing local-first design: they do not require cloud
 services, relays, or a broader network listener.

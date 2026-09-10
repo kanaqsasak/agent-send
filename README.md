@@ -70,16 +70,26 @@ The local automation API accepts only loopback addresses; stop the daemon with C
   devices to show and confirm the pairing code, trust the peer ID, and retain a
   distinct 32-byte out-of-band pairing secret. Encrypted frames bind both peer
   IDs and a monotonic sequence before folder/path policy receives any plaintext.
+  Create an invitation with `POST /v1/pairings` on loopback; it returns a
+  six-digit code and a 32-byte hexadecimal `pairing_secret`. Convey both to the
+  other device out of band, create its matching invitation by including its
+  `code` and `pairing_secret` with that peer's advertisement, then confirm each
+  local invitation with `POST /v1/pairings/confirm`. Codes expire after five
+  minutes and are consumed on successful confirmation. Re-pairing a peer
+  replaces its secret; revoke with `DELETE /v1/peers/{peer_id}`.
 - If mDNS is unavailable or isolated, add a peer's explicit `HOST:8742` address
   through the daemon integration/manual-peer adapter, then perform the same
   visible pairing and trust checks. A manual address is not a trust grant.
 
-The socket listener and deterministic transfer seam are implemented, but the
-runnable binary does **not** yet provide a cross-device UI or persisted
-pairing-secret exchange. Do not treat its local pairing-code endpoints as a
-complete production pairing flow; integrations must register the human-derived
-secret on both trusted daemons. This limitation is intentional rather than a
-fallback to unauthenticated transport.
+Confirmed peer records and pairing secrets are persisted through an isolated
+trusted-peer storage abstraction. The current default is an atomic local JSON
+file (`trusted-peers.json`, adjacent to the identity; owner-only permissions on
+Unix). It is **not** an OS credential store and secrets are not encrypted at
+rest by the daemon; protect the per-user data directory accordingly. A platform
+credential-store adapter can replace this storage boundary in a future release.
+The runnable binary still has no cross-device pairing UI, so an integration
+must safely convey the invitation's secret and code out of band; socket traffic
+never falls back to unauthenticated transport.
 
 ## Planned clients
 

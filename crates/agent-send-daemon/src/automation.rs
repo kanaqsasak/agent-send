@@ -506,8 +506,8 @@ mod tests {
             address: "127.0.0.1:1".into(),
             api_version: crate::API_VERSION,
         };
-        let code = registry.request_pairing(peer).code;
-        assert!(registry.confirm_pairing("peer", &code));
+        let code = registry.request_pairing(peer, 0).unwrap().code;
+        assert!(registry.confirm_pairing("peer", &code, 0));
         let actor = AuthorizedAgent {
             id: "agent".into(),
             scope: scope(),

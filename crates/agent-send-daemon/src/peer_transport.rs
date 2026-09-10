@@ -39,6 +39,28 @@ impl PairingSecret {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    pub(crate) fn generate() -> Result<Self, PeerChannelError> {
+        let mut bytes = [0; 32];
+        getrandom::getrandom(&mut bytes).map_err(|_| PeerChannelError::Random)?;
+        Ok(Self(bytes))
+    }
+
+    pub(crate) fn to_hex(&self) -> String {
+        self.0.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    pub(crate) fn from_hex(value: &str) -> Result<Self, PeerChannelError> {
+        if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(PeerChannelError::InvalidPairingSecret);
+        }
+        let mut bytes = [0; 32];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16)
+                .map_err(|_| PeerChannelError::InvalidPairingSecret)?;
+        }
+        Ok(Self(bytes))
+    }
 }
 
 impl fmt::Debug for PairingSecret {
@@ -65,6 +87,10 @@ impl PairedPeer {
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub(crate) fn secret(&self) -> &PairingSecret {
+        &self.secret
     }
 }
 
@@ -209,6 +235,10 @@ pub enum PeerChannelError {
     ChunkTooLarge(usize),
     #[error("peer frame sequence space exhausted")]
     SequenceExhausted,
+    #[error("secure pairing-secret generation failed")]
+    Random,
+    #[error("pairing secret must be a 32-byte hexadecimal value")]
+    InvalidPairingSecret,
 }
 
 pub struct SecurePeerChannel {

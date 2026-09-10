@@ -49,10 +49,16 @@ The MCP adapter should be a separate process or thin adapter over this API. It s
 ## Security boundaries
 
 - LAN traffic is encrypted and peer-authenticated; discovery metadata is not treated as trust.
-- Pairing establishes a device key and human-visible alias. Trust can be revoked independently per peer.
+- Pairing establishes a per-peer 32-byte secret and human-visible alias. A
+  loopback pairing invitation returns that secret plus a six-digit code; both
+  are conveyed out of band, the code expires after five minutes, and a
+  successful confirmation consumes it. A new confirmed pairing rotates the
+  stored secret. Trust can be revoked independently per peer.
 - Shared folders are capabilities, not path strings. A capability contains a stable ID, root path, direction, and policy.
 - Resolve and validate paths beneath the configured root; reject traversal, symlink escapes, and unexpected overwrite.
-- Agent tokens are local-only, scoped, revocable, and stored using the OS credential store where available.
+- Agent tokens are local-only, scoped, and revocable. The current daemon uses
+  isolated local-file storage adapters; it does not implement an OS credential
+  store.
 - No inbound internet listener. Bind the agent API to loopback or a local IPC socket.
 
 ## Protocol direction
@@ -63,9 +69,9 @@ Begin with a versioned HTTP/JSON control protocol and streamed file bodies, comp
 
 `SecurePeerChannel` is the versioned peer control/transfer seam. A human-confirmed pairing must supply a distinct out-of-band 32-byte secret for each trusted peer; HKDF derives direction-specific keys and every control message or bounded 64 KiB file chunk is authenticated and encrypted with ChaCha20-Poly1305. Frames bind protocol version, sender, recipient, and a strictly monotonic sequence as associated data, so replay, misrouting, downgrade, and tampering are rejected before transfer policy sees plaintext. `PeerTransport` carries only these encrypted frames, while `TransferEngine` continues to own capabilities, hashes, cancellation, and idempotency.
 
-The daemon owns a separate paired-peer TCP listener (default port 8742), starts/stops mDNS with its lifecycle, publishes its `_agent-send._tcp.local.` advertisement, and feeds received hints into the untrusted peer registry. The local automation API remains loopback-only. A listener accepts a transfer only when its peer ID is already trusted and a distinct out-of-band pairing secret has been registered locally; it never accepts secrets from DNS-SD or the socket.
+The daemon owns a separate paired-peer TCP listener (default port 8742), starts/stops mDNS with its lifecycle, publishes its `_agent-send._tcp.local.` advertisement, and feeds received hints into the untrusted peer registry. The local automation API remains loopback-only. A listener accepts a transfer only when its peer ID and pairing secret are loaded from confirmed persisted trust; it never accepts secrets from DNS-SD or the socket. `PeerTrustStore` isolates this state from pairing and transport. The shipped `FilePeerTrustStore` writes an atomic JSON file with owner-only Unix permissions, but does not encrypt secrets at rest or use an OS credential store.
 
-mDNS needs multicast UDP 5353 and the service needs inbound TCP 8742 on trusted LANs; Wi-Fi client isolation and platform firewall behavior remain deployment tests rather than claimed cross-platform guarantees. Explicit `HOST:8742` manual advertisements use the same untrusted-registry and pairing path when mDNS is unavailable. The runnable daemon still lacks a persisted, cross-device pairing-secret exchange and OS firewall/sleep/interface integration. That limitation is explicit: the tested socket transport is an authenticated integration seam, not a claim that the pairing UX is production complete.
+mDNS needs multicast UDP 5353 and the service needs inbound TCP 8742 on trusted LANs; Wi-Fi client isolation and platform firewall behavior remain deployment tests rather than claimed cross-platform guarantees. Explicit `HOST:8742` manual advertisements use the same untrusted-registry and pairing path when mDNS is unavailable. The runnable daemon has a persisted local request/confirm/revoke pairing flow, but still lacks a cross-device pairing UI and OS firewall/sleep/interface integration. An integration must convey invitation material out of band; the tested socket transport uses only persisted trust and never claims an OS credential-store implementation.
 
 ## Decisions to validate early
 

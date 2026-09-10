@@ -89,6 +89,14 @@ fn stop_daemon(app: &tauri::AppHandle) {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn hide_dock(app: &tauri::AppHandle) {
+    let _ = app.set_dock_visibility(false);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn hide_dock(_app: &tauri::AppHandle) {}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(
@@ -104,7 +112,7 @@ pub fn run() {
             start_daemon(&app.handle());
             // This is a tray-only application on macOS. The window is opened
             // only by a left click on the tray icon.
-            let _ = app.handle().set_dock_visibility(false);
+            hide_dock(&app.handle());
 
             let about = MenuItem::with_id(app, "about", "About agent-send", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;

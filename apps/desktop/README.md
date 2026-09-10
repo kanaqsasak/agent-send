@@ -5,11 +5,17 @@ the Rust daemon remains a separate per-user process and owns health, transfers,
 and filesystem access. The shell polls `GET /v1/health` and `GET /v1/peers`, displaying this device's
 identity, discovered peers, and their trust state. Unknown peers can be paired
 with a short-code confirmation; trusted peers can be revoked. Pairing and peer
-list failures are shown inline and loading states are explicit. Closing the
-window hides it without stopping the daemon.
+list failures are shown inline and loading states are explicit.
+
+The app is tray-first: left-clicking the tray icon opens a compact frameless
+popover anchored to the tray, while right-clicking opens a context menu with
+only About and Quit. The popover hides when it loses focus; there are no inline
+window close or hide buttons. Its title bar uses the same white radar/discovery
+mark as the monochrome tray icon, and the app hides its macOS Dock icon.
 
 The frontend only retains the short code and peer metadata needed for the
-current view. It intentionally discards the daemon's `pairing_secret` response:
+current view. The window uses system colors, native system typography, and
+light/dark mode styling rather than a browser-oriented visual theme. It intentionally discards the daemon's `pairing_secret` response:
 secrets and bearer tokens are never displayed, logged, or written to browser
 storage. The daemon remains responsible for secret storage and authenticated
 peer traffic.

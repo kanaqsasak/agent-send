@@ -60,7 +60,7 @@ cargo run -p agent-send-daemon -- --identity-path /tmp/agent-send-dev.json --hid
 cargo run -p agent-send-cli -- health --addr 127.0.0.1:8123
 ```
 
-The local automation API accepts only loopback addresses; stop the daemon with Ctrl-C. The daemon also starts a separate paired-peer TCP listener on `0.0.0.0:8742` by default. It never exposes the automation API on that listener. The desktop app will be added after the core protocol and security boundaries are validated. See [the threat model](docs/THREAT_MODEL.md) and [release readiness](docs/RELEASE_READINESS.md) for verified test coverage and explicit unverified claims.
+The local automation API accepts only loopback addresses; stop the daemon with Ctrl-C. The daemon also starts a separate paired-peer TCP listener on `0.0.0.0:8742` by default. It never exposes the automation API on that listener. The desktop app is available under `apps/desktop`; see its README for development and packaging. See [the threat model](docs/THREAT_MODEL.md) and [release readiness](docs/RELEASE_READINESS.md) for verified test coverage and explicit unverified claims.
 
 ## LAN networking and pairing
 
@@ -97,6 +97,6 @@ never falls back to unauthenticated transport.
 ## Planned clients
 
 1. Desktop tray app (macOS, Windows, Linux)
-2. CLI (`agent-send send`, `agent-send receive`, `agent-send peers`)
+2. CLI (`agent-send health`, `agent-send peers`, `agent-send demo`)
 3. Local agent API / MCP adapter
 4. Mobile clients, if the protocol proves useful beyond laptops

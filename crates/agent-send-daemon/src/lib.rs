@@ -2,7 +2,10 @@
 //!
 //! The local API is deliberately small and transport-independent types are kept
 //! public so a different local transport can be added without changing daemon
-//! state or configuration.
+//! state or configuration. Authenticated automation clients use `POST /v1/agent`
+//! with an `Authorization: Bearer` header and JSON `{ "operation", "params" }`.
+//! Supported operations are `peers.list`, `folders.list`, `transfers.submit`
+//! (also `transfers.send`), `transfers.status`, and `transfers.cancel`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -16,10 +19,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
+pub mod automation;
 pub mod discovery;
 pub mod peer_transport;
 pub mod transfer;
 
+pub use automation::{
+    AgentScope, AgentTokenStore, AgentTransferState, AgentTransferStatus, AuditEntry,
+    FileAgentTokenStore, FoldersResponse, IssuedAgentToken, MemoryAgentTokenStore,
+};
 pub use discovery::{
     DiscoveryError, MdnsDiscovery, MockPeerDiscovery, PeerDiscovery, MDNS_SERVICE_TYPE,
 };
@@ -217,6 +225,8 @@ pub enum DaemonError {
     UntrustedPeer(String),
     #[error(transparent)]
     PeerChannel(#[from] PeerChannelError),
+    #[error(transparent)]
+    Automation(#[from] automation::AutomationError),
     #[error("daemon thread failed to stop")]
     Shutdown,
 }
@@ -224,29 +234,62 @@ pub enum DaemonError {
 pub struct Daemon {
     config: Config,
     identity: LocalIdentity,
-    registry: PeerRegistry,
-    transfer: transfer::TransferEngine,
+    registry: Arc<Mutex<PeerRegistry>>,
+    transfer: Arc<transfer::TransferEngine>,
+    agent_tokens: Arc<automation::AgentTokens>,
+    agent_transfers: Arc<automation::AgentTransfers>,
+    audit: Arc<automation::AuditLog>,
 }
 
 impl Daemon {
     pub fn new(config: Config) -> Result<Self, DaemonError> {
+        let token_store = Arc::new(automation::FileAgentTokenStore::new(
+            automation::token_store_path(&config.identity_path),
+        ));
+        Self::with_token_store(config, token_store)
+    }
+
+    /// Construct a daemon with an explicit token persistence adapter. This
+    /// lets platform credential stores replace the default local file without
+    /// altering token scopes or local API authorization.
+    pub fn with_token_store(
+        config: Config,
+        token_store: Arc<dyn automation::AgentTokenStore>,
+    ) -> Result<Self, DaemonError> {
         config.validate()?;
         let identity = load_or_create_identity(&config.identity_path)?;
         let registry = load_trusted_peers(&trusted_peers_path(&config.identity_path))?;
         Ok(Self {
             config,
             identity,
-            registry,
-            transfer: transfer::TransferEngine::new(),
+            registry: Arc::new(Mutex::new(registry)),
+            transfer: Arc::new(transfer::TransferEngine::new()),
+            agent_tokens: Arc::new(automation::AgentTokens::load(token_store)?),
+            agent_transfers: Arc::new(automation::AgentTransfers::default()),
+            audit: Arc::new(automation::AuditLog::default()),
         })
     }
 
+    /// Issue a local bearer token with explicit peer and folder capabilities.
+    /// Callers must retain the raw token; only a one-way hash is persisted.
+    pub fn issue_agent_token(&self, scope: AgentScope) -> Result<IssuedAgentToken, DaemonError> {
+        Ok(self.agent_tokens.issue(scope)?)
+    }
+
+    pub fn revoke_agent_token(&self, id: &str) -> Result<bool, DaemonError> {
+        Ok(self.agent_tokens.revoke(id)?)
+    }
+
+    pub fn audit_entries(&self) -> Vec<AuditEntry> {
+        self.audit.entries()
+    }
+
     pub fn peers(&self) -> Vec<PeerRecord> {
-        self.registry.list()
+        self.registry.lock().unwrap().list()
     }
 
     pub fn advertise_peer(&mut self, advertisement: PeerAdvertisement) {
-        self.registry.advertise(advertisement);
+        self.registry.lock().unwrap().advertise(advertisement);
     }
 
     /// Publish local LAN presence through a discovery adapter. Advertisements
@@ -268,7 +311,7 @@ impl Daemon {
         let advertisements = discovery.discover()?;
         let count = advertisements.len();
         for advertisement in advertisements {
-            self.registry.advertise(advertisement);
+            self.registry.lock().unwrap().advertise(advertisement);
         }
         Ok(count)
     }
@@ -279,6 +322,8 @@ impl Daemon {
     pub fn secure_peer_channel(&self, peer: PairedPeer) -> Result<SecurePeerChannel, DaemonError> {
         if !self
             .registry
+            .lock()
+            .unwrap()
             .peers
             .get(peer.id())
             .is_some_and(|record| record.trusted)
@@ -289,27 +334,23 @@ impl Daemon {
     }
 
     pub fn request_pairing(&mut self, advertisement: PeerAdvertisement) -> PairingResponse {
-        self.registry.request_pairing(advertisement)
+        self.registry.lock().unwrap().request_pairing(advertisement)
     }
 
     pub fn confirm_pairing(&mut self, peer_id: &str, code: &str) -> Result<bool, DaemonError> {
-        let confirmed = self.registry.confirm_pairing(peer_id, code);
+        let mut registry = self.registry.lock().unwrap();
+        let confirmed = registry.confirm_pairing(peer_id, code);
         if confirmed {
-            save_trusted_peers(
-                &trusted_peers_path(&self.config.identity_path),
-                &self.registry,
-            )?;
+            save_trusted_peers(&trusted_peers_path(&self.config.identity_path), &registry)?;
         }
         Ok(confirmed)
     }
 
     pub fn revoke_peer(&mut self, peer_id: &str) -> Result<bool, DaemonError> {
-        let revoked = self.registry.revoke(peer_id);
+        let mut registry = self.registry.lock().unwrap();
+        let revoked = registry.revoke(peer_id);
         if revoked {
-            save_trusted_peers(
-                &trusted_peers_path(&self.config.identity_path),
-                &self.registry,
-            )?;
+            save_trusted_peers(&trusted_peers_path(&self.config.identity_path), &registry)?;
         }
         Ok(revoked)
     }
@@ -333,7 +374,7 @@ impl Daemon {
     }
 
     pub fn transfer_engine(&self) -> &transfer::TransferEngine {
-        &self.transfer
+        self.transfer.as_ref()
     }
 
     /// Version-independent local client entry point for the current loopback
@@ -362,17 +403,35 @@ impl Daemon {
         listener.set_nonblocking(true).map_err(DaemonError::Bind)?;
         let local_addr = listener.local_addr().map_err(DaemonError::Bind)?;
         let identity = self.identity;
-        let registry = Arc::new(Mutex::new(self.registry));
+        let registry = self.registry;
+        let transfer = self.transfer;
+        let agent_tokens = self.agent_tokens;
+        let agent_transfers = self.agent_transfers;
+        let audit = self.audit;
+        let server_audit = audit.clone();
         let persist_path = trusted_peers_path(&self.config.identity_path);
         let (shutdown_tx, shutdown_rx) = mpsc::channel();
 
         let thread = thread::Builder::new()
             .name("agent-send-local-api".into())
-            .spawn(move || run_server(listener, identity, registry, persist_path, shutdown_rx))
+            .spawn(move || {
+                run_server(
+                    listener,
+                    identity,
+                    registry,
+                    transfer,
+                    agent_tokens,
+                    agent_transfers,
+                    server_audit,
+                    persist_path,
+                    shutdown_rx,
+                )
+            })
             .map_err(DaemonError::Bind)?;
 
         Ok(RunningDaemon {
             local_addr,
+            audit,
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -381,6 +440,7 @@ impl Daemon {
 
 pub struct RunningDaemon {
     local_addr: SocketAddr,
+    audit: Arc<automation::AuditLog>,
     shutdown_tx: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
 }
@@ -388,6 +448,10 @@ pub struct RunningDaemon {
 impl RunningDaemon {
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    pub fn audit_entries(&self) -> Vec<AuditEntry> {
+        self.audit.entries()
     }
 
     /// Signals the server and waits for its worker to exit.
@@ -420,6 +484,10 @@ fn run_server(
     listener: TcpListener,
     identity: LocalIdentity,
     registry: Arc<Mutex<PeerRegistry>>,
+    transfer: Arc<TransferEngine>,
+    agent_tokens: Arc<automation::AgentTokens>,
+    agent_transfers: Arc<automation::AgentTransfers>,
+    audit: Arc<automation::AuditLog>,
     persist_path: PathBuf,
     shutdown: mpsc::Receiver<()>,
 ) {
@@ -428,7 +496,16 @@ fn run_server(
             return;
         }
         match listener.accept() {
-            Ok((stream, _)) => handle_connection(stream, &identity, &registry, &persist_path),
+            Ok((stream, _)) => handle_connection(
+                stream,
+                &identity,
+                &registry,
+                &transfer,
+                &agent_tokens,
+                &agent_transfers,
+                &audit,
+                &persist_path,
+            ),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -441,6 +518,10 @@ fn handle_connection(
     mut stream: TcpStream,
     identity: &LocalIdentity,
     registry: &Arc<Mutex<PeerRegistry>>,
+    transfer: &TransferEngine,
+    agent_tokens: &automation::AgentTokens,
+    agent_transfers: &automation::AgentTransfers,
+    audit: &automation::AuditLog,
     persist_path: &Path,
 ) {
     // TCP does not preserve HTTP request boundaries. Read complete headers and
@@ -494,6 +575,15 @@ fn handle_connection(
                 .unwrap(),
             )
         }
+        (Some("POST"), Some("/v1/agent")) => handle_agent_request(
+            head,
+            body,
+            registry,
+            transfer,
+            agent_tokens,
+            agent_transfers,
+            audit,
+        ),
         (Some("POST"), Some("/v1/pairings")) | (Some("POST"), Some("/v1/pairing")) => {
             match serde_json::from_str::<PeerAdvertisement>(body) {
                 Ok(ad) => {
@@ -542,6 +632,183 @@ fn handle_connection(
     );
     let _ = stream.write_all(header.as_bytes());
     let _ = stream.write_all(body.as_bytes());
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentOperationRequest {
+    operation: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
+#[derive(Debug, Deserialize)]
+struct TransferIdParams {
+    transfer_id: String,
+}
+
+fn handle_agent_request(
+    head: &str,
+    body: &str,
+    registry: &Arc<Mutex<PeerRegistry>>,
+    transfer: &TransferEngine,
+    agent_tokens: &automation::AgentTokens,
+    agent_transfers: &automation::AgentTransfers,
+    audit: &automation::AuditLog,
+) -> (&'static str, String) {
+    let request = match serde_json::from_str::<AgentOperationRequest>(body) {
+        Ok(request) => request,
+        Err(_) => {
+            audit.record(
+                "unauthenticated",
+                "invalid_request",
+                None,
+                Vec::new(),
+                None,
+                "denied",
+            );
+            return agent_error("400 Bad Request", "invalid_request");
+        }
+    };
+    let token = header_value(head, "authorization").and_then(|value| value.strip_prefix("Bearer "));
+    let Some(actor) = token.and_then(|token| agent_tokens.authorize(token)) else {
+        audit.record(
+            "unauthenticated",
+            request.operation,
+            None,
+            Vec::new(),
+            None,
+            "denied",
+        );
+        return agent_error("401 Unauthorized", "unauthorized");
+    };
+    let actor_id = actor.id.clone();
+    let operation = request.operation.as_str();
+    let response = match operation {
+        "peers.list" => {
+            let peers = registry
+                .lock()
+                .unwrap()
+                .list()
+                .into_iter()
+                .filter(|peer| peer.trusted && actor.scope.allows_peer(&peer.advertisement.id))
+                .collect::<Vec<_>>();
+            audit.record(actor_id, operation, None, Vec::new(), None, "ok");
+            Ok(serde_json::to_value(PeersResponse {
+                version: API_VERSION,
+                peers,
+            })
+            .expect("peer response serializes"))
+        }
+        "folders.list" => {
+            let folders = transfer
+                .folders()
+                .into_iter()
+                .filter(|(id, _)| actor.scope.allows_folder(id))
+                .map(|(id, direction)| automation::FolderResponse { id, direction })
+                .collect();
+            audit.record(actor_id, operation, None, Vec::new(), None, "ok");
+            Ok(serde_json::to_value(FoldersResponse {
+                version: API_VERSION,
+                folders,
+            })
+            .expect("folder response serializes"))
+        }
+        "transfers.submit" | "transfers.send" => {
+            let submission =
+                match serde_json::from_value::<agent_send_core::TransferRequest>(request.params) {
+                    Ok(submission) => submission,
+                    Err(_) => {
+                        audit.record(actor_id, operation, None, Vec::new(), None, "denied");
+                        return agent_error("400 Bad Request", "invalid_request");
+                    }
+                };
+            let peer_id = Some(submission.peer_id.clone());
+            let folder_ids = vec![
+                submission.source_folder_id.clone(),
+                submission.destination_folder_id.clone(),
+            ];
+            let result = agent_transfers.submit(
+                &actor,
+                &submission,
+                &registry.lock().unwrap().list(),
+                transfer,
+            );
+            audit.record(
+                actor_id,
+                operation,
+                peer_id,
+                folder_ids,
+                result
+                    .as_ref()
+                    .ok()
+                    .map(|status| status.transfer_id.clone()),
+                if result.is_ok() { "ok" } else { "denied" },
+            );
+            result.and_then(|status| {
+                serde_json::to_value(status)
+                    .map_err(|_| automation::AutomationError::ScopeDenied("serialization".into()))
+            })
+        }
+        "transfers.status" | "transfers.cancel" => {
+            let params = match serde_json::from_value::<TransferIdParams>(request.params) {
+                Ok(params) => params,
+                Err(_) => {
+                    audit.record(actor_id, operation, None, Vec::new(), None, "denied");
+                    return agent_error("400 Bad Request", "invalid_request");
+                }
+            };
+            let result = if operation == "transfers.status" {
+                agent_transfers.status(&actor, &params.transfer_id)
+            } else {
+                agent_transfers.cancel(&actor, &params.transfer_id)
+            };
+            audit.record(
+                actor_id,
+                operation,
+                None,
+                Vec::new(),
+                Some(params.transfer_id),
+                if result.is_ok() { "ok" } else { "denied" },
+            );
+            result.and_then(|status| {
+                serde_json::to_value(status)
+                    .map_err(|_| automation::AutomationError::ScopeDenied("serialization".into()))
+            })
+        }
+        _ => {
+            audit.record(actor_id, operation, None, Vec::new(), None, "denied");
+            return agent_error("404 Not Found", "unknown_operation");
+        }
+    };
+    match response {
+        Ok(result) => (
+            "200 OK",
+            serde_json::json!({ "version": API_VERSION, "result": result }).to_string(),
+        ),
+        Err(error) => {
+            let (status, code) = match error {
+                automation::AutomationError::UntrustedPeer(_)
+                | automation::AutomationError::ScopeDenied(_) => ("403 Forbidden", "forbidden"),
+                automation::AutomationError::TransferNotFound => {
+                    ("404 Not Found", "transfer_not_found")
+                }
+                automation::AutomationError::Transfer(_) => ("400 Bad Request", "invalid_transfer"),
+                _ => ("400 Bad Request", "invalid_request"),
+            };
+            agent_error(status, code)
+        }
+    }
+}
+
+fn agent_error(status: &'static str, code: &str) -> (&'static str, String) {
+    (status, serde_json::json!({ "error": code }).to_string())
+}
+
+fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
 }
 
 fn request_is_complete(request: &[u8]) -> bool {
@@ -759,6 +1026,137 @@ mod tests {
         let _ = fs::remove_file(trusted_peers_path(
             &std::env::temp_dir().join(format!("agent-send-test-{}-pairing", std::process::id())),
         ));
+    }
+
+    fn agent_request(
+        addr: SocketAddr,
+        token: Option<&str>,
+        operation: &str,
+        params: serde_json::Value,
+    ) -> String {
+        let body = serde_json::json!({ "operation": operation, "params": params }).to_string();
+        let authorization = token
+            .map(|token| format!("Authorization: Bearer {token}\r\n"))
+            .unwrap_or_default();
+        let mut stream = TcpStream::connect(addr).unwrap();
+        write!(
+            stream,
+            "POST /v1/agent HTTP/1.1\r\nHost: localhost\r\n{authorization}Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        response
+    }
+
+    #[test]
+    fn authenticated_agent_api_enforces_scopes_and_tracks_submission_lifecycle() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-agent-api-root",
+            std::process::id()
+        ));
+        let identity = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-agent-api-identity",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_file(&identity);
+        let _ = fs::remove_file(trusted_peers_path(&identity));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("safe.txt"), b"safe").unwrap();
+        let store = Arc::new(MemoryAgentTokenStore::default());
+        let mut daemon = Daemon::with_token_store(config(&identity), store).unwrap();
+        daemon.add_shared_folder("source", &root, agent_send_core::FolderDirection::Read);
+        let paired = daemon.request_pairing(advertisement("trusted"));
+        assert!(daemon.confirm_pairing("trusted", &paired.code).unwrap());
+        daemon.advertise_peer(advertisement("untrusted"));
+        let token = daemon
+            .issue_agent_token(AgentScope {
+                peer_ids: ["trusted".to_owned(), "untrusted".to_owned()]
+                    .into_iter()
+                    .collect(),
+                folder_ids: ["source".to_owned(), "destination".to_owned()]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
+        let running = daemon.start().unwrap();
+        let addr = running.local_addr();
+
+        assert!(
+            agent_request(addr, None, "peers.list", serde_json::json!({}))
+                .starts_with("HTTP/1.1 401 Unauthorized")
+        );
+        let folders = agent_request(
+            addr,
+            Some(&token.token),
+            "folders.list",
+            serde_json::json!({}),
+        );
+        assert!(folders.starts_with("HTTP/1.1 200 OK") && folders.contains("source"));
+        assert!(!folders.contains("destination"));
+
+        let request = |peer: &str, source: &str| {
+            serde_json::json!({
+                "peer_id": peer,
+                "source_folder_id": "source",
+                "source_paths": [source],
+                "destination_folder_id": "destination",
+                "idempotency_key": format!("{peer}-{source}"),
+            })
+        };
+        assert!(agent_request(
+            addr,
+            Some(&token.token),
+            "transfers.submit",
+            request("trusted", "../outside")
+        )
+        .starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(agent_request(
+            addr,
+            Some(&token.token),
+            "transfers.submit",
+            request("untrusted", "safe.txt")
+        )
+        .starts_with("HTTP/1.1 403 Forbidden"));
+        let submitted = agent_request(
+            addr,
+            Some(&token.token),
+            "transfers.submit",
+            request("trusted", "safe.txt"),
+        );
+        assert!(
+            submitted.contains("\"transfer_id\":\"local-1\"") && submitted.contains("submitted")
+        );
+        let status = agent_request(
+            addr,
+            Some(&token.token),
+            "transfers.status",
+            serde_json::json!({ "transfer_id": "local-1" }),
+        );
+        assert!(status.contains("submitted"));
+        let cancelled = agent_request(
+            addr,
+            Some(&token.token),
+            "transfers.cancel",
+            serde_json::json!({ "transfer_id": "local-1" }),
+        );
+        assert!(cancelled.contains("cancelled"));
+        let audit = running.audit_entries();
+        assert!(audit
+            .iter()
+            .any(|entry| entry.operation == "transfers.cancel" && entry.result == "ok"));
+        assert!(audit
+            .iter()
+            .all(|entry| !serde_json::to_string(entry).unwrap().contains(&token.token)));
+        running.shutdown().unwrap();
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(identity);
+        let _ = fs::remove_file(trusted_peers_path(&std::env::temp_dir().join(format!(
+            "agent-send-test-{}-agent-api-identity",
+            std::process::id()
+        ))));
     }
 
     #[test]

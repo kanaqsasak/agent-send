@@ -84,6 +84,26 @@ impl TransferEngine {
         self.folders.lock().unwrap().keys().cloned().collect()
     }
 
+    pub fn folders(&self) -> Vec<(String, agent_send_core::FolderDirection)> {
+        self.folders
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, policy)| (id.clone(), policy.direction().clone()))
+            .collect()
+    }
+
+    /// Check an agent submission before it is handed to a peer transport.
+    /// Only named source capabilities and relative paths are accepted.
+    pub fn validate_submission(&self, request: &TransferRequest) -> Result<(), TransferError> {
+        request.validate()?;
+        let source = self.folder(&request.source_folder_id)?;
+        for path in &request.source_paths {
+            source.resolve(path, PathOperation::Read)?;
+        }
+        Ok(())
+    }
+
     /// Send through the in-process loopback seam. No network discovery is involved.
     pub fn send_loopback<F>(
         &self,

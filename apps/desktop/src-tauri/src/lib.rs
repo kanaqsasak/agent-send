@@ -50,8 +50,12 @@ fn start_daemon(app: &tauri::AppHandle) {
             return;
         }
     };
-    let Some(path) = daemon_path(&resource_dir) else {
-        // `tauri dev` intentionally permits using a separately started daemon.
+    let path = daemon_path(&resource_dir).or_else(|| {
+        // In development, staged sidecars live beside this crate rather than
+        // in Tauri's packaged resource directory.
+        daemon_path(Path::new(env!("CARGO_MANIFEST_DIR")).join("binaries").as_path())
+    });
+    let Some(path) = path else {
         eprintln!("agent-send: bundled daemon not found; use the documented development daemon");
         return;
     };

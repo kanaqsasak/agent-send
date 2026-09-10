@@ -57,7 +57,29 @@ cargo run -p agent-send-daemon -- --identity-path /tmp/agent-send-dev.json --hid
 cargo run -p agent-send-cli -- health --addr 127.0.0.1:8123
 ```
 
-Only loopback addresses are accepted; stop the daemon with Ctrl-C. The desktop app will be added after the core protocol and security boundaries are validated.
+The local automation API accepts only loopback addresses; stop the daemon with Ctrl-C. The daemon also starts a separate paired-peer TCP listener on `0.0.0.0:8742` by default. It never exposes the automation API on that listener. The desktop app will be added after the core protocol and security boundaries are validated.
+
+## LAN networking and pairing
+
+- Discovery publishes and browses the DNS-SD service `_agent-send._tcp.local.`.
+  It uses mDNS multicast UDP port **5353** (`224.0.0.251` / `ff02::fb`).
+- Authenticated peer traffic uses TCP port **8742** by default. Allow inbound TCP
+  8742 and multicast UDP 5353 on a trusted private LAN if a host firewall blocks
+  them. Wi-Fi client isolation can still prevent discovery and direct sockets.
+- Discovery metadata is an untrusted endpoint hint. A transfer requires both
+  devices to show and confirm the pairing code, trust the peer ID, and retain a
+  distinct 32-byte out-of-band pairing secret. Encrypted frames bind both peer
+  IDs and a monotonic sequence before folder/path policy receives any plaintext.
+- If mDNS is unavailable or isolated, add a peer's explicit `HOST:8742` address
+  through the daemon integration/manual-peer adapter, then perform the same
+  visible pairing and trust checks. A manual address is not a trust grant.
+
+The socket listener and deterministic transfer seam are implemented, but the
+runnable binary does **not** yet provide a cross-device UI or persisted
+pairing-secret exchange. Do not treat its local pairing-code endpoints as a
+complete production pairing flow; integrations must register the human-derived
+secret on both trusted daemons. This limitation is intentional rather than a
+fallback to unauthenticated transport.
 
 ## Planned clients
 

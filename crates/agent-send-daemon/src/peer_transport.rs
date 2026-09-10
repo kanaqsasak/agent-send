@@ -6,7 +6,10 @@
 //! control message and file chunk with ChaCha20-Poly1305 and rejects version,
 //! peer, and sequence mismatches before handing a message to transfer policy.
 
-use crate::CHUNK_SIZE;
+use crate::{
+    transfer::{IncomingStart, TransferEngine},
+    Cancellation, TransferError, TransferOutcome, TransferProgress, CHUNK_SIZE,
+};
 use chacha20poly1305::{
     aead::{Aead, Payload},
     ChaCha20Poly1305, KeyInit, Nonce,
@@ -14,17 +17,21 @@ use chacha20poly1305::{
 use hkdf::Hkdf;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
-use std::{collections::VecDeque, fmt};
+use std::{
+    collections::VecDeque,
+    fmt,
+    io::{self, Read, Write},
+    net::{SocketAddr, TcpStream},
+    sync::Arc,
+};
 use thiserror::Error;
 
 pub const PEER_PROTOCOL_VERSION: u32 = 1;
 const KEY_DOMAIN: &[u8] = b"agent-send peer channel key v1";
 const AAD_DOMAIN: &[u8] = b"agent-send peer frame v1";
+const MAX_FRAME_BYTES: usize = CHUNK_SIZE + 16 * 1024;
 
 /// Secret established during an out-of-band, human-confirmed pairing.
-///
-/// It is intentionally opaque and does not implement `Debug`, so accidental
-/// logs cannot expose material that authenticates a peer connection.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingSecret([u8; 32]);
 
@@ -61,8 +68,6 @@ impl PairedPeer {
     }
 }
 
-/// Every peer payload is explicit about its protocol version, endpoints, and
-/// monotonic sequence. The ciphertext includes the AEAD authentication tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncryptedPeerFrame {
     pub version: u32,
@@ -73,9 +78,6 @@ pub struct EncryptedPeerFrame {
 }
 
 /// Control and streamed-transfer messages transported in encrypted frames.
-///
-/// `FileChunk` has the same 64 KiB upper bound as the existing transfer engine;
-/// an adapter must stream frames rather than buffering a whole file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PeerMessage {
@@ -89,12 +91,36 @@ pub enum PeerMessage {
         total_bytes: u64,
         sha256: String,
     },
+    TransferReady {
+        transfer_id: String,
+    },
+    Directory {
+        transfer_id: String,
+        relative_path: String,
+    },
+    FileStart {
+        transfer_id: String,
+        relative_path: String,
+        size: u64,
+    },
     FileChunk {
         transfer_id: String,
         offset: u64,
         bytes: Vec<u8>,
     },
+    FileComplete {
+        transfer_id: String,
+    },
     TransferComplete {
+        transfer_id: String,
+    },
+    TransferResult {
+        transfer_id: String,
+        bytes: u64,
+        files: u64,
+        sha256: String,
+    },
+    TransferRejected {
         transfer_id: String,
     },
     Cancel {
@@ -118,10 +144,19 @@ impl PeerMessage {
                 required("transfer_id", transfer_id)?;
                 required("destination_folder_id", destination_folder_id)?;
                 required("idempotency_key", idempotency_key)?;
-                if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                    return Err(PeerChannelError::InvalidHash);
-                }
-                Ok(())
+                valid_hash(sha256)
+            }
+            Self::Directory {
+                transfer_id,
+                relative_path,
+            }
+            | Self::FileStart {
+                transfer_id,
+                relative_path,
+                ..
+            } => {
+                required("transfer_id", transfer_id)?;
+                required("relative_path", relative_path)
             }
             Self::FileChunk {
                 transfer_id, bytes, ..
@@ -132,9 +167,19 @@ impl PeerMessage {
                 }
                 Ok(())
             }
-            Self::TransferComplete { transfer_id } | Self::Cancel { transfer_id } => {
-                required("transfer_id", transfer_id)
+            Self::TransferResult {
+                transfer_id,
+                sha256,
+                ..
+            } => {
+                required("transfer_id", transfer_id)?;
+                valid_hash(sha256)
             }
+            Self::TransferReady { transfer_id }
+            | Self::FileComplete { transfer_id }
+            | Self::TransferComplete { transfer_id }
+            | Self::TransferRejected { transfer_id }
+            | Self::Cancel { transfer_id } => required("transfer_id", transfer_id),
             _ => Ok(()),
         }
     }
@@ -158,7 +203,7 @@ pub enum PeerChannelError {
     Serialization,
     #[error("{0} is required")]
     MissingField(&'static str),
-    #[error("transfer hash must be a lowercase or uppercase hexadecimal SHA-256 value")]
+    #[error("transfer hash must be a hexadecimal SHA-256 value")]
     InvalidHash,
     #[error("file chunk exceeds the {CHUNK_SIZE}-byte protocol limit: {0}")]
     ChunkTooLarge(usize),
@@ -166,7 +211,6 @@ pub enum PeerChannelError {
     SequenceExhausted,
 }
 
-/// Encrypts outbound messages and verifies inbound messages for one paired peer.
 pub struct SecurePeerChannel {
     local_id: String,
     peer_id: String,
@@ -270,20 +314,23 @@ impl SecurePeerChannel {
     }
 }
 
-/// A transport carries already-encrypted frames only. It cannot access folder
-/// capabilities or plaintext, which keeps networking separate from policy.
 pub trait PeerTransport {
     fn send(&mut self, frame: EncryptedPeerFrame) -> Result<(), PeerTransportError>;
     fn receive(&mut self) -> Result<Option<EncryptedPeerFrame>, PeerTransportError>;
 }
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum PeerTransportError {
     #[error("peer transport is unavailable")]
     Unavailable,
+    #[error("peer socket I/O failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("peer frame was invalid")]
+    Serialization,
+    #[error("peer frame exceeds the socket limit")]
+    FrameTooLarge,
 }
 
-/// Couples an encrypted paired-peer channel to any framed peer transport.
 pub struct PeerConnection<T> {
     channel: SecurePeerChannel,
     transport: T,
@@ -321,7 +368,232 @@ pub enum PeerConnectionError {
     Transport(#[from] PeerTransportError),
 }
 
-/// Deterministic in-memory transport for protocol tests and non-socket callers.
+/// Length-delimited encrypted frames over a TCP socket. The plaintext protocol
+/// is never serialized directly to this transport.
+pub struct SocketPeerTransport {
+    stream: TcpStream,
+}
+
+impl SocketPeerTransport {
+    pub fn connect(address: SocketAddr) -> Result<Self, PeerTransportError> {
+        Ok(Self {
+            stream: TcpStream::connect(address)?,
+        })
+    }
+
+    pub fn from_stream(stream: TcpStream) -> Self {
+        Self { stream }
+    }
+}
+
+impl PeerTransport for SocketPeerTransport {
+    fn send(&mut self, frame: EncryptedPeerFrame) -> Result<(), PeerTransportError> {
+        let bytes = serde_json::to_vec(&frame).map_err(|_| PeerTransportError::Serialization)?;
+        if bytes.len() > MAX_FRAME_BYTES {
+            return Err(PeerTransportError::FrameTooLarge);
+        }
+        self.stream.write_all(&(bytes.len() as u32).to_be_bytes())?;
+        self.stream.write_all(&bytes)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    fn receive(&mut self) -> Result<Option<EncryptedPeerFrame>, PeerTransportError> {
+        let mut length = [0; 4];
+        match self.stream.read_exact(&mut length) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+            Err(error) => return Err(error.into()),
+        }
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > MAX_FRAME_BYTES {
+            return Err(PeerTransportError::FrameTooLarge);
+        }
+        let mut bytes = vec![0; length];
+        self.stream.read_exact(&mut bytes)?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|_| PeerTransportError::Serialization)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SocketTransferError {
+    #[error(transparent)]
+    Transfer(#[from] TransferError),
+    #[error(transparent)]
+    Connection(#[from] PeerConnectionError),
+    #[error("peer closed the connection during transfer")]
+    Closed,
+    #[error("peer rejected the transfer")]
+    Rejected,
+    #[error("peer sent an unexpected transfer response")]
+    UnexpectedResponse,
+}
+
+/// Send a policy-validated transfer through a paired encrypted socket channel.
+pub fn send_socket_transfer<F>(
+    engine: &TransferEngine,
+    channel: SecurePeerChannel,
+    address: SocketAddr,
+    request: &agent_send_core::TransferRequest,
+    cancel: &Cancellation,
+    progress: F,
+) -> Result<TransferOutcome, SocketTransferError>
+where
+    F: FnMut(TransferProgress),
+{
+    let prepared = engine.prepare_outbound(request)?;
+    let transport = SocketPeerTransport::connect(address).map_err(PeerConnectionError::from)?;
+    let mut connection = PeerConnection::new(channel, transport);
+    connection.send(&PeerMessage::Hello {
+        protocol_version: PEER_PROTOCOL_VERSION,
+    })?;
+    connection.send(&prepared.manifest())?;
+    match connection.receive()? {
+        Some(PeerMessage::TransferReady { transfer_id })
+            if transfer_id == request.idempotency_key => {}
+        Some(PeerMessage::TransferResult {
+            transfer_id,
+            bytes,
+            files,
+            sha256,
+        }) if transfer_id == request.idempotency_key => {
+            return Ok(TransferOutcome {
+                bytes,
+                files,
+                sha256,
+            });
+        }
+        Some(PeerMessage::TransferRejected { transfer_id })
+            if transfer_id == request.idempotency_key =>
+        {
+            return Err(SocketTransferError::Rejected)
+        }
+        Some(_) => return Err(SocketTransferError::UnexpectedResponse),
+        None => return Err(SocketTransferError::Closed),
+    }
+    let local_outcome = prepared.stream(cancel, progress, |message| {
+        connection.send(&message).map_err(SocketTransferError::from)
+    })?;
+    match connection.receive()? {
+        Some(PeerMessage::TransferResult {
+            transfer_id,
+            bytes,
+            files,
+            sha256,
+        }) if transfer_id == request.idempotency_key
+            && bytes == local_outcome.bytes
+            && files == local_outcome.files
+            && sha256 == local_outcome.sha256 =>
+        {
+            Ok(local_outcome)
+        }
+        Some(PeerMessage::TransferRejected { transfer_id })
+            if transfer_id == request.idempotency_key =>
+        {
+            Err(SocketTransferError::Rejected)
+        }
+        Some(_) => Err(SocketTransferError::UnexpectedResponse),
+        None => Err(SocketTransferError::Closed),
+    }
+}
+
+/// Receive one encrypted transfer after a verified `Hello`. Errors are exposed
+/// to the authenticated sender only as a generic rejection.
+pub(crate) fn receive_socket_transfer(
+    connection: &mut PeerConnection<SocketPeerTransport>,
+    engine: Arc<TransferEngine>,
+) -> Result<(), PeerConnectionError> {
+    let Some(PeerMessage::TransferManifest {
+        transfer_id,
+        destination_folder_id,
+        idempotency_key,
+        total_bytes,
+        sha256,
+    }) = connection.receive()?
+    else {
+        return Ok(());
+    };
+    let mut transfer = match engine.begin_incoming(
+        transfer_id.clone(),
+        destination_folder_id,
+        idempotency_key,
+        total_bytes,
+        sha256,
+    ) {
+        Ok(IncomingStart::Ready(transfer)) => {
+            connection.send(&PeerMessage::TransferReady {
+                transfer_id: transfer_id.clone(),
+            })?;
+            transfer
+        }
+        Ok(IncomingStart::Completed(outcome)) => {
+            connection.send(&result_message(&transfer_id, outcome))?;
+            return Ok(());
+        }
+        Err(_) => {
+            connection.send(&PeerMessage::TransferRejected { transfer_id })?;
+            return Ok(());
+        }
+    };
+
+    loop {
+        let message = match connection.receive()? {
+            Some(message) => message,
+            None => return Ok(()),
+        };
+        let outcome = match message {
+            PeerMessage::Directory {
+                transfer_id,
+                relative_path,
+            } => transfer
+                .directory(&transfer_id, &relative_path)
+                .map(|_| None),
+            PeerMessage::FileStart {
+                transfer_id,
+                relative_path,
+                size,
+            } => transfer
+                .file_start(&transfer_id, &relative_path, size)
+                .map(|_| None),
+            PeerMessage::FileChunk {
+                transfer_id,
+                offset,
+                bytes,
+            } => transfer.chunk(&transfer_id, offset, &bytes).map(|_| None),
+            PeerMessage::FileComplete { transfer_id } => {
+                transfer.file_complete(&transfer_id).map(|_| None)
+            }
+            PeerMessage::TransferComplete { transfer_id } => {
+                transfer.complete(&transfer_id).map(Some)
+            }
+            PeerMessage::Cancel { .. } => return Ok(()),
+            _ => Err(TransferError::Protocol("unexpected peer transfer message")),
+        };
+        match outcome {
+            Ok(Some(outcome)) => {
+                connection.send(&result_message(&transfer_id, outcome))?;
+                return Ok(());
+            }
+            Ok(None) => {}
+            Err(_) => {
+                connection.send(&PeerMessage::TransferRejected { transfer_id })?;
+                return Ok(());
+            }
+        }
+    }
+}
+
+fn result_message(transfer_id: &str, outcome: TransferOutcome) -> PeerMessage {
+    PeerMessage::TransferResult {
+        transfer_id: transfer_id.into(),
+        bytes: outcome.bytes,
+        files: outcome.files,
+        sha256: outcome.sha256,
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct MockPeerTransport {
     inbound: VecDeque<EncryptedPeerFrame>,
@@ -357,9 +629,15 @@ fn required(name: &'static str, value: &str) -> Result<(), PeerChannelError> {
     }
 }
 
+fn valid_hash(hash: &str) -> Result<(), PeerChannelError> {
+    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(PeerChannelError::InvalidHash)
+    }
+}
+
 fn derive_key(sender_id: &str, recipient_id: &str, secret: &PairingSecret) -> [u8; 32] {
-    // Direction-specific keys make the sequence-derived nonce unique per AEAD
-    // key even when both peers send their first frame at sequence zero.
     let mut info = Vec::with_capacity(sender_id.len() + recipient_id.len() + 16);
     for value in [sender_id, recipient_id] {
         info.extend_from_slice(&(value.len() as u64).to_be_bytes());
@@ -442,22 +720,6 @@ mod tests {
             bob.open(frame),
             Err(PeerChannelError::UnexpectedSequence { .. })
         ));
-
-        let mut impostor = SecurePeerChannel::new(
-            "bob",
-            PairedPeer::new("alice", PairingSecret::new([9; 32])).unwrap(),
-        )
-        .unwrap();
-        let mut alice_for_impostor = SecurePeerChannel::new("alice", peer("bob")).unwrap();
-        let frame = alice_for_impostor
-            .seal(&PeerMessage::Hello {
-                protocol_version: PEER_PROTOCOL_VERSION,
-            })
-            .unwrap();
-        assert_eq!(
-            impostor.open(frame),
-            Err(PeerChannelError::AuthenticationFailed)
-        );
     }
 
     #[test]

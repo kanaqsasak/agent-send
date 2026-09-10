@@ -126,12 +126,14 @@ pub fn run_demo() -> Result<DemoResult, Box<dyn Error>> {
     let sample = b"agent-send deterministic demo\n";
     fs::write(source_root.join("sample.txt"), sample)?;
 
-    let sender = Daemon::new(Config::with_identity_path(
-        root.join("sender-identity.json"),
-    ))?;
-    let receiver = Daemon::new(Config::with_identity_path(
-        root.join("receiver-identity.json"),
-    ))?;
+    let mut sender_config = Config::with_identity_path(root.join("sender-identity.json"));
+    sender_config.peer_bind_addr = "127.0.0.1:0".parse()?;
+    sender_config.discovery_enabled = false;
+    let mut receiver_config = Config::with_identity_path(root.join("receiver-identity.json"));
+    receiver_config.peer_bind_addr = "127.0.0.1:0".parse()?;
+    receiver_config.discovery_enabled = false;
+    let sender = Daemon::new(sender_config)?;
+    let receiver = Daemon::new(receiver_config)?;
     sender.add_shared_folder("source", &source_root, FolderDirection::Read);
     receiver.add_shared_folder("destination", &destination_root, FolderDirection::Write);
     let request = TransferRequest {

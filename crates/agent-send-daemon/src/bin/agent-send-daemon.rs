@@ -1,4 +1,4 @@
-use agent_send_daemon::{Config, Daemon, MdnsDiscovery};
+use agent_send_daemon::{Config, Daemon};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -78,25 +78,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     if let Some(identity_path) = arguments.identity_path {
         config.identity_path = identity_path;
     }
-    // Daemon::new validates this again, including values supplied by config files.
+    config.discovery_enabled &= !arguments.hidden;
+    // Daemon::new validates the local API bind again, including config values.
     let daemon = Daemon::new(config)?;
     let running = daemon.start()?;
-    eprintln!("agent-send-daemon listening on {}", running.local_addr());
-
-    // Browsing is intentionally best-effort: mDNS is optional on platforms
-    // without a usable LAN service. The local API remains the only socket owned
-    // by this process, and is always loopback-only.
-    let _discovery = if arguments.hidden {
-        None
-    } else {
-        match MdnsDiscovery::new() {
-            Ok(discovery) => Some(discovery),
-            Err(error) => {
-                eprintln!("agent-send-daemon: discovery unavailable: {error}");
-                None
-            }
-        }
-    };
+    eprintln!(
+        "agent-send-daemon local API on {}; paired-peer listener on {}",
+        running.local_addr(),
+        running.peer_addr()
+    );
 
     let stopped = Arc::new(AtomicBool::new(false));
     let signal = stopped.clone();

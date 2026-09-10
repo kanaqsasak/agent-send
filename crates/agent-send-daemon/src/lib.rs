@@ -32,9 +32,10 @@ pub use discovery::{
     DiscoveryError, MdnsDiscovery, MockPeerDiscovery, PeerDiscovery, MDNS_SERVICE_TYPE,
 };
 pub use peer_transport::{
-    EncryptedPeerFrame, MockPeerTransport, PairedPeer, PairingSecret, PeerChannelError,
-    PeerConnection, PeerConnectionError, PeerMessage, PeerTransport, PeerTransportError,
-    SecurePeerChannel, PEER_PROTOCOL_VERSION,
+    send_socket_transfer, EncryptedPeerFrame, MockPeerTransport, PairedPeer, PairingSecret,
+    PeerChannelError, PeerConnection, PeerConnectionError, PeerMessage, PeerTransport,
+    PeerTransportError, SecurePeerChannel, SocketPeerTransport, SocketTransferError,
+    PEER_PROTOCOL_VERSION,
 };
 pub use transfer::{
     Cancellation, LoopbackTransport, TransferEngine, TransferError, TransferOutcome,
@@ -51,6 +52,14 @@ pub struct Config {
     /// File containing the daemon's local identity placeholder.
     #[serde(default = "default_identity_path")]
     pub identity_path: PathBuf,
+    /// LAN listener for encrypted paired-peer traffic. This is separate from
+    /// the local automation API and may intentionally bind beyond loopback.
+    #[serde(default = "default_peer_bind_addr")]
+    pub peer_bind_addr: SocketAddr,
+    /// Disable mDNS publication and browsing while retaining the paired-peer
+    /// listener for explicit manual-address connections.
+    #[serde(default = "default_discovery_enabled")]
+    pub discovery_enabled: bool,
 }
 
 impl Default for Config {
@@ -58,6 +67,8 @@ impl Default for Config {
         Self {
             bind_addr: default_bind_addr(),
             identity_path: default_identity_path(),
+            peer_bind_addr: default_peer_bind_addr(),
+            discovery_enabled: default_discovery_enabled(),
         }
     }
 }
@@ -253,6 +264,8 @@ pub enum DaemonError {
     #[error(transparent)]
     PeerChannel(#[from] PeerChannelError),
     #[error(transparent)]
+    SocketTransfer(#[from] SocketTransferError),
+    #[error(transparent)]
     Automation(#[from] automation::AutomationError),
     #[error("daemon thread failed to stop")]
     Shutdown,
@@ -266,6 +279,7 @@ pub struct Daemon {
     agent_tokens: Arc<automation::AgentTokens>,
     agent_transfers: Arc<automation::AgentTransfers>,
     audit: Arc<automation::AuditLog>,
+    paired_peers: Arc<Mutex<BTreeMap<String, PairedPeer>>>,
 }
 
 impl Daemon {
@@ -294,6 +308,7 @@ impl Daemon {
             agent_tokens: Arc::new(automation::AgentTokens::load(token_store)?),
             agent_transfers: Arc::new(automation::AgentTransfers::default()),
             audit: Arc::new(automation::AuditLog::default()),
+            paired_peers: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -358,6 +373,64 @@ impl Daemon {
             return Err(DaemonError::UntrustedPeer(peer.id().to_owned()));
         }
         Ok(SecurePeerChannel::new(self.identity.id.clone(), peer)?)
+    }
+
+    /// Attach the out-of-band secret produced by a human-confirmed pairing to
+    /// an already trusted peer. Discovery and the local pairing code never
+    /// supply this secret, so a DNS-SD hint cannot authorize a socket channel.
+    pub fn register_paired_peer(&self, peer: PairedPeer) -> Result<(), DaemonError> {
+        self.secure_peer_channel(peer.clone())?;
+        self.paired_peers
+            .lock()
+            .unwrap()
+            .insert(peer.id().to_owned(), peer);
+        Ok(())
+    }
+
+    /// Stream one transfer through the authenticated paired-peer TCP listener.
+    /// Source and destination folder checks remain in `TransferEngine`; this
+    /// method only selects a trusted discovered or manually entered endpoint.
+    pub fn send_to_peer_socket<F>(
+        &self,
+        peer_id: &str,
+        request: &agent_send_core::TransferRequest,
+        cancel: &Cancellation,
+        progress: F,
+    ) -> Result<TransferOutcome, DaemonError>
+    where
+        F: FnMut(TransferProgress),
+    {
+        if request.peer_id != peer_id {
+            return Err(DaemonError::UntrustedPeer(peer_id.to_owned()));
+        }
+        let peer = self
+            .paired_peers
+            .lock()
+            .unwrap()
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
+        let address = self
+            .registry
+            .lock()
+            .unwrap()
+            .peers
+            .get(peer_id)
+            .filter(|record| record.trusted)
+            .ok_or_else(|| DaemonError::UntrustedPeer(peer_id.to_owned()))?
+            .advertisement
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|_| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
+        let channel = self.secure_peer_channel(peer)?;
+        Ok(send_socket_transfer(
+            &self.transfer,
+            channel,
+            address,
+            request,
+            cancel,
+            progress,
+        )?)
     }
 
     pub fn request_pairing(&mut self, advertisement: PeerAdvertisement) -> PairingResponse {
@@ -425,51 +498,135 @@ impl Daemon {
         )
     }
 
-    pub fn start(self) -> Result<RunningDaemon, DaemonError> {
-        let listener = TcpListener::bind(self.config.bind_addr).map_err(DaemonError::Bind)?;
-        listener.set_nonblocking(true).map_err(DaemonError::Bind)?;
-        let local_addr = listener.local_addr().map_err(DaemonError::Bind)?;
-        let identity = self.identity;
-        let registry = self.registry;
-        let transfer = self.transfer;
-        let agent_tokens = self.agent_tokens;
-        let agent_transfers = self.agent_transfers;
-        let audit = self.audit;
-        let server_audit = audit.clone();
-        let persist_path = trusted_peers_path(&self.config.identity_path);
-        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+    /// Start the loopback automation API, paired-peer socket listener, and
+    /// best-effort mDNS lifecycle. Discovery failure never broadens the local
+    /// API bind or disables explicit manual-address peer connections.
+    pub fn start(&self) -> Result<RunningDaemon, DaemonError> {
+        let discovery = if self.config.discovery_enabled {
+            MdnsDiscovery::new()
+                .ok()
+                .map(|discovery| Box::new(discovery) as Box<dyn PeerDiscovery>)
+        } else {
+            None
+        };
+        self.start_inner(discovery)
+    }
 
-        let thread = thread::Builder::new()
+    /// Start with a caller-provided discovery adapter. This is primarily the
+    /// deterministic integration seam used by socket lifecycle tests.
+    pub fn start_with_discovery<D: PeerDiscovery + 'static>(
+        &self,
+        discovery: D,
+    ) -> Result<RunningDaemon, DaemonError> {
+        self.start_inner(Some(Box::new(discovery)))
+    }
+
+    fn start_inner(
+        &self,
+        discovery: Option<Box<dyn PeerDiscovery>>,
+    ) -> Result<RunningDaemon, DaemonError> {
+        let local_listener = TcpListener::bind(self.config.bind_addr).map_err(DaemonError::Bind)?;
+        local_listener
+            .set_nonblocking(true)
+            .map_err(DaemonError::Bind)?;
+        let local_addr = local_listener.local_addr().map_err(DaemonError::Bind)?;
+        let peer_listener =
+            TcpListener::bind(self.config.peer_bind_addr).map_err(DaemonError::Bind)?;
+        peer_listener
+            .set_nonblocking(true)
+            .map_err(DaemonError::Bind)?;
+        let peer_addr = peer_listener.local_addr().map_err(DaemonError::Bind)?;
+        let advertisement = PeerAdvertisement {
+            id: self.identity.id.clone(),
+            alias: format!("agent-send-{}", self.identity.id),
+            address: peer_addr.to_string(),
+            api_version: API_VERSION,
+        };
+        let audit = self.audit.clone();
+        let mut shutdowns = Vec::new();
+        let mut threads = Vec::new();
+
+        let (local_shutdown_tx, local_shutdown_rx) = mpsc::channel();
+        shutdowns.push(local_shutdown_tx);
+        let local_thread = thread::Builder::new()
             .name("agent-send-local-api".into())
-            .spawn(move || {
-                run_server(
-                    listener,
-                    identity,
-                    registry,
-                    transfer,
-                    agent_tokens,
-                    agent_transfers,
-                    server_audit,
-                    persist_path,
-                    shutdown_rx,
-                )
+            .spawn({
+                let identity = self.identity.clone();
+                let registry = self.registry.clone();
+                let transfer = self.transfer.clone();
+                let agent_tokens = self.agent_tokens.clone();
+                let agent_transfers = self.agent_transfers.clone();
+                let server_audit = self.audit.clone();
+                let persist_path = trusted_peers_path(&self.config.identity_path);
+                move || {
+                    run_server(
+                        local_listener,
+                        identity,
+                        registry,
+                        transfer,
+                        agent_tokens,
+                        agent_transfers,
+                        server_audit,
+                        persist_path,
+                        local_shutdown_rx,
+                    )
+                }
             })
             .map_err(DaemonError::Bind)?;
+        threads.push(local_thread);
+
+        let (peer_shutdown_tx, peer_shutdown_rx) = mpsc::channel();
+        shutdowns.push(peer_shutdown_tx);
+        let peer_thread = thread::Builder::new()
+            .name("agent-send-peer-listener".into())
+            .spawn({
+                let identity = self.identity.clone();
+                let registry = self.registry.clone();
+                let paired_peers = self.paired_peers.clone();
+                let transfer = self.transfer.clone();
+                move || {
+                    run_peer_server(
+                        peer_listener,
+                        identity,
+                        registry,
+                        paired_peers,
+                        transfer,
+                        peer_shutdown_rx,
+                    )
+                }
+            })
+            .map_err(DaemonError::Bind)?;
+        threads.push(peer_thread);
+
+        if let Some(discovery) = discovery {
+            let (discovery_shutdown_tx, discovery_shutdown_rx) = mpsc::channel();
+            shutdowns.push(discovery_shutdown_tx);
+            let discovery_thread = thread::Builder::new()
+                .name("agent-send-discovery".into())
+                .spawn({
+                    let registry = self.registry.clone();
+                    move || run_discovery(discovery, advertisement, registry, discovery_shutdown_rx)
+                })
+                .map_err(DaemonError::Bind)?;
+            threads.push(discovery_thread);
+        }
 
         Ok(RunningDaemon {
             local_addr,
+            peer_addr,
             audit,
-            shutdown_tx: Some(shutdown_tx),
-            thread: Some(thread),
+            shutdowns,
+            threads,
         })
     }
 }
 
 pub struct RunningDaemon {
     local_addr: SocketAddr,
+    peer_addr: SocketAddr,
     audit: Arc<automation::AuditLog>,
-    shutdown_tx: Option<Sender<()>>,
-    thread: Option<JoinHandle<()>>,
+    shutdowns: Vec<Sender<()>>,
+    threads: Vec<JoinHandle<()>>,
 }
 
 impl RunningDaemon {
@@ -477,34 +634,128 @@ impl RunningDaemon {
         self.local_addr
     }
 
+    /// The LAN listener address. This is never used for the loopback-only
+    /// automation API.
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
     pub fn audit_entries(&self) -> Vec<AuditEntry> {
         self.audit.entries()
     }
 
-    /// Signals the server and waits for its worker to exit.
+    /// Signals every owned service and waits for their workers to exit.
     pub fn shutdown(mut self) -> Result<(), DaemonError> {
-        self.shutdown_tx
-            .take()
-            .expect("shutdown sender present")
-            .send(())
-            .ok();
-        self.thread
-            .take()
-            .expect("daemon thread present")
-            .join()
-            .map_err(|_| DaemonError::Shutdown)
+        for sender in self.shutdowns.drain(..) {
+            let _ = sender.send(());
+        }
+        for thread in self.threads.drain(..) {
+            thread.join().map_err(|_| DaemonError::Shutdown)?;
+        }
+        Ok(())
     }
 }
 
 impl Drop for RunningDaemon {
     fn drop(&mut self) {
-        if let Some(sender) = self.shutdown_tx.take() {
+        for sender in self.shutdowns.drain(..) {
             let _ = sender.send(());
         }
-        if let Some(thread) = self.thread.take() {
+        for thread in self.threads.drain(..) {
             let _ = thread.join();
         }
     }
+}
+
+fn run_discovery(
+    mut discovery: Box<dyn PeerDiscovery>,
+    advertisement: PeerAdvertisement,
+    registry: Arc<Mutex<PeerRegistry>>,
+    shutdown: mpsc::Receiver<()>,
+) {
+    if discovery.publish(&advertisement).is_err() {
+        return;
+    }
+    loop {
+        if shutdown.try_recv().is_ok() {
+            return;
+        }
+        if let Ok(advertisements) = discovery.discover() {
+            let mut peers = registry.lock().unwrap();
+            for advertisement in advertisements {
+                peers.advertise(advertisement);
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn run_peer_server(
+    listener: TcpListener,
+    identity: LocalIdentity,
+    registry: Arc<Mutex<PeerRegistry>>,
+    paired_peers: Arc<Mutex<BTreeMap<String, PairedPeer>>>,
+    transfer: Arc<TransferEngine>,
+    shutdown: mpsc::Receiver<()>,
+) {
+    loop {
+        if shutdown.try_recv().is_ok() {
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => handle_peer_connection(
+                stream,
+                &identity,
+                &registry,
+                &paired_peers,
+                transfer.clone(),
+            ),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+fn handle_peer_connection(
+    stream: TcpStream,
+    identity: &LocalIdentity,
+    registry: &Arc<Mutex<PeerRegistry>>,
+    paired_peers: &Arc<Mutex<BTreeMap<String, PairedPeer>>>,
+    transfer: Arc<TransferEngine>,
+) {
+    if stream.set_nonblocking(false).is_err() {
+        return;
+    }
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let mut transport = SocketPeerTransport::from_stream(stream);
+    let Ok(Some(first_frame)) = transport.receive() else {
+        return;
+    };
+    let peer_id = first_frame.sender_id.clone();
+    let Some(peer) = paired_peers.lock().unwrap().get(&peer_id).cloned() else {
+        return;
+    };
+    if !registry
+        .lock()
+        .unwrap()
+        .peers
+        .get(&peer_id)
+        .is_some_and(|record| record.trusted)
+    {
+        return;
+    }
+    let Ok(mut channel) = SecurePeerChannel::new(identity.id.clone(), peer) else {
+        return;
+    };
+    if !matches!(channel.open(first_frame), Ok(PeerMessage::Hello { protocol_version }) if protocol_version == PEER_PROTOCOL_VERSION)
+    {
+        return;
+    }
+    let mut connection = PeerConnection::new(channel, transport);
+    let _ = peer_transport::receive_socket_transfer(&mut connection, transfer);
 }
 
 fn run_server(
@@ -881,11 +1132,16 @@ fn load_or_create_identity(path: &Path) -> Result<LocalIdentity, DaemonError> {
 }
 
 fn new_identity() -> LocalIdentity {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let value = format!("{nanos:032x}");
+    let mut bytes = [0u8; 16];
+    let value = if getrandom::getrandom(&mut bytes).is_ok() {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    } else {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{nanos:032x}")
+    };
     LocalIdentity {
         id: format!("device-{}", &value[..16]),
         key_placeholder: value,
@@ -942,6 +1198,14 @@ fn default_bind_addr() -> SocketAddr {
     SocketAddr::from(([127, 0, 0, 1], 0))
 }
 
+fn default_peer_bind_addr() -> SocketAddr {
+    SocketAddr::from(([0, 0, 0, 0], 8742))
+}
+
+fn default_discovery_enabled() -> bool {
+    true
+}
+
 fn user_data_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -956,11 +1220,15 @@ fn default_identity_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpStream;
-    use std::time::Duration;
+    use std::collections::VecDeque;
+    use std::net::{TcpListener, TcpStream};
+    use std::time::{Duration, Instant};
 
     fn config(path: &Path) -> Config {
-        Config::with_identity_path(path)
+        let mut config = Config::with_identity_path(path);
+        config.peer_bind_addr = "127.0.0.1:0".parse().unwrap();
+        config.discovery_enabled = false;
+        config
     }
 
     #[test]
@@ -1019,6 +1287,188 @@ mod tests {
             address: "127.0.0.1:9000".into(),
             api_version: API_VERSION,
         }
+    }
+
+    fn unused_loopback_addr() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        address
+    }
+
+    #[derive(Default)]
+    struct RecordingDiscoveryState {
+        published: Vec<PeerAdvertisement>,
+        discovered: VecDeque<PeerAdvertisement>,
+    }
+
+    struct RecordingDiscovery(Arc<Mutex<RecordingDiscoveryState>>);
+
+    impl PeerDiscovery for RecordingDiscovery {
+        fn publish(&mut self, advertisement: &PeerAdvertisement) -> Result<(), DiscoveryError> {
+            self.0.lock().unwrap().published.push(advertisement.clone());
+            Ok(())
+        }
+
+        fn discover(&mut self) -> Result<Vec<PeerAdvertisement>, DiscoveryError> {
+            Ok(self.0.lock().unwrap().discovered.drain(..).collect())
+        }
+    }
+
+    #[test]
+    fn daemon_lifecycle_publishes_and_consumes_discovery_hints() {
+        let identity = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-discovery-lifecycle",
+            std::process::id()
+        ));
+        let state = Arc::new(Mutex::new(RecordingDiscoveryState::default()));
+        state
+            .lock()
+            .unwrap()
+            .discovered
+            .push_back(advertisement("lan-hint"));
+        let daemon = Daemon::new(config(&identity)).unwrap();
+        let running = daemon
+            .start_with_discovery(RecordingDiscovery(state.clone()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while daemon.peers().is_empty() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let published = state.lock().unwrap().published.clone();
+        assert_eq!(published.len(), 1);
+        assert_eq!(published[0].id, daemon.identity().id);
+        assert_eq!(published[0].address, running.peer_addr().to_string());
+        assert_eq!(daemon.peers()[0].advertisement.id, "lan-hint");
+        assert!(!daemon.peers()[0].trusted);
+        running.shutdown().unwrap();
+        let _ = fs::remove_file(identity);
+    }
+
+    #[test]
+    fn paired_daemons_transfer_over_authenticated_local_sockets() {
+        let root = std::env::temp_dir().join(format!(
+            "agent-send-test-{}-socket-transfer",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let source_root = root.join("source");
+        let destination_root = root.join("destination");
+        fs::create_dir_all(source_root.join("nested")).unwrap();
+        fs::create_dir_all(&destination_root).unwrap();
+        fs::write(
+            source_root.join("nested/file.txt"),
+            b"authenticated socket transfer",
+        )
+        .unwrap();
+
+        let sender_identity = root.join("sender-identity.json");
+        let receiver_identity = root.join("receiver-identity.json");
+        let mut sender_config = config(&sender_identity);
+        sender_config.peer_bind_addr = unused_loopback_addr();
+        let mut receiver_config = config(&receiver_identity);
+        receiver_config.peer_bind_addr = unused_loopback_addr();
+        let mut sender = Daemon::new(sender_config.clone()).unwrap();
+        let mut receiver = Daemon::new(receiver_config.clone()).unwrap();
+        sender.add_shared_folder(
+            "source",
+            &source_root,
+            agent_send_core::FolderDirection::Read,
+        );
+        receiver.add_shared_folder(
+            "destination",
+            &destination_root,
+            agent_send_core::FolderDirection::Write,
+        );
+        receiver.add_shared_folder(
+            "read-only",
+            &destination_root,
+            agent_send_core::FolderDirection::Read,
+        );
+
+        let sender_advertisement = PeerAdvertisement {
+            id: sender.identity().id.clone(),
+            alias: "sender".into(),
+            address: sender_config.peer_bind_addr.to_string(),
+            api_version: API_VERSION,
+        };
+        let receiver_advertisement = PeerAdvertisement {
+            id: receiver.identity().id.clone(),
+            alias: "receiver".into(),
+            address: receiver_config.peer_bind_addr.to_string(),
+            api_version: API_VERSION,
+        };
+        let sender_pairing = sender.request_pairing(receiver_advertisement.clone());
+        assert!(sender
+            .confirm_pairing(&receiver_advertisement.id, &sender_pairing.code)
+            .unwrap());
+        let receiver_pairing = receiver.request_pairing(sender_advertisement.clone());
+        assert!(receiver
+            .confirm_pairing(&sender_advertisement.id, &receiver_pairing.code)
+            .unwrap());
+        let secret = PairingSecret::new([42; 32]);
+        assert!(matches!(
+            sender.send_to_peer_socket(
+                &receiver_advertisement.id,
+                &agent_send_core::TransferRequest {
+                    peer_id: receiver_advertisement.id.clone(),
+                    source_folder_id: "source".into(),
+                    source_paths: vec!["nested/file.txt".into()],
+                    destination_folder_id: "destination".into(),
+                    idempotency_key: "socket-transfer".into(),
+                },
+                &Cancellation::new(),
+                |_| {},
+            ),
+            Err(DaemonError::UntrustedPeer(_))
+        ));
+        sender
+            .register_paired_peer(
+                PairedPeer::new(&receiver_advertisement.id, secret.clone()).unwrap(),
+            )
+            .unwrap();
+        receiver
+            .register_paired_peer(PairedPeer::new(&sender_advertisement.id, secret).unwrap())
+            .unwrap();
+
+        let receiver_running = receiver.start().unwrap();
+        let sender_running = sender.start().unwrap();
+        let request = agent_send_core::TransferRequest {
+            peer_id: receiver_advertisement.id.clone(),
+            source_folder_id: "source".into(),
+            source_paths: vec!["nested/file.txt".into()],
+            destination_folder_id: "destination".into(),
+            idempotency_key: "socket-transfer".into(),
+        };
+        let mut denied_request = request.clone();
+        denied_request.destination_folder_id = "read-only".into();
+        denied_request.idempotency_key = "socket-transfer-denied".into();
+        assert!(matches!(
+            sender.send_to_peer_socket(
+                &receiver_advertisement.id,
+                &denied_request,
+                &Cancellation::new(),
+                |_| {},
+            ),
+            Err(DaemonError::SocketTransfer(SocketTransferError::Rejected))
+        ));
+        assert!(!destination_root.join("nested/file.txt").exists());
+        let outcome = sender
+            .send_to_peer_socket(
+                &receiver_advertisement.id,
+                &request,
+                &Cancellation::new(),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(outcome.bytes, b"authenticated socket transfer".len() as u64);
+        assert_eq!(
+            fs::read(destination_root.join("nested/file.txt")).unwrap(),
+            b"authenticated socket transfer"
+        );
+        sender_running.shutdown().unwrap();
+        receiver_running.shutdown().unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

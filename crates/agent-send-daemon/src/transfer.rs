@@ -1,16 +1,17 @@
 //! Transport-independent transfer engine.
 //!
-//! The engine only accepts named [`PathPolicy`] capabilities. `LoopbackTransport`
-//! is the deterministic transport seam used now; a future HTTP/QUIC adapter can
-//! carry the same manifest and chunk stream without moving policy into transport.
+//! The engine only accepts named [`PathPolicy`] capabilities. Socket framing is
+//! kept in `peer_transport`; this module prepares and consumes the same bounded
+//! manifest/chunk stream while retaining all filesystem policy decisions here.
 
+use crate::peer_transport::PeerMessage;
 use agent_send_core::{
     path_policy::{PathOperation, PathPolicy, PathPolicyError},
     TransferRequest,
 };
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -51,6 +52,12 @@ pub enum TransferError {
     Cancelled,
     #[error("destination already exists: {0}")]
     DestinationExists(PathBuf),
+    #[error("peer transfer protocol error: {0}")]
+    Protocol(&'static str),
+    #[error("peer transfer byte count did not match its manifest")]
+    SizeMismatch,
+    #[error("peer transfer hash did not match its manifest")]
+    HashMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +125,68 @@ impl TransferEngine {
         request.validate()?;
         let source = self.folder(&request.source_folder_id)?;
         receiver.receive(request, &source, cancel, progress)
+    }
+
+    pub(crate) fn prepare_outbound(
+        &self,
+        request: &TransferRequest,
+    ) -> Result<PreparedTransfer, TransferError> {
+        self.validate_submission(request)?;
+        let source = self.folder(&request.source_folder_id)?;
+        let mut items = Vec::new();
+        for name in &request.source_paths {
+            let relative = PathBuf::from(name);
+            let path = source.resolve(&relative, PathOperation::Read)?;
+            collect_items(&source, &path, &relative, &mut items)?;
+        }
+        let total_bytes = items.iter().map(|item| item.size).sum();
+        let sha256 = hash_items(&items)?;
+        Ok(PreparedTransfer {
+            transfer_id: request.idempotency_key.clone(),
+            destination_folder_id: request.destination_folder_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            total_bytes,
+            sha256,
+            items,
+        })
+    }
+
+    pub(crate) fn begin_incoming(
+        self: &Arc<Self>,
+        transfer_id: String,
+        destination_folder_id: String,
+        idempotency_key: String,
+        total_bytes: u64,
+        sha256: String,
+    ) -> Result<IncomingStart, TransferError> {
+        if let Some(outcome) = self
+            .completed
+            .lock()
+            .unwrap()
+            .get(&idempotency_key)
+            .cloned()
+        {
+            return Ok(IncomingStart::Completed(outcome));
+        }
+        let destination = self.folder(&destination_folder_id)?;
+        // Check the named capability and its write direction before telling a
+        // remote peer that it may send any file content.
+        destination.resolve(Path::new("."), PathOperation::Write)?;
+        Ok(IncomingStart::Ready(IncomingTransfer {
+            engine: self.clone(),
+            transfer_id,
+            idempotency_key,
+            destination,
+            total_bytes,
+            expected_hash: sha256,
+            bytes: 0,
+            files: 0,
+            hash: Sha256::new(),
+            active_file: None,
+            targets: BTreeSet::new(),
+            committed_targets: Vec::new(),
+            completed: false,
+        }))
     }
 
     fn folder(&self, id: &str) -> Result<PathPolicy, TransferError> {
@@ -209,6 +278,286 @@ impl TransferEngine {
     }
 }
 
+pub(crate) struct PreparedTransfer {
+    transfer_id: String,
+    destination_folder_id: String,
+    idempotency_key: String,
+    total_bytes: u64,
+    sha256: String,
+    items: Vec<FileItem>,
+}
+
+impl PreparedTransfer {
+    pub(crate) fn manifest(&self) -> PeerMessage {
+        PeerMessage::TransferManifest {
+            transfer_id: self.transfer_id.clone(),
+            destination_folder_id: self.destination_folder_id.clone(),
+            idempotency_key: self.idempotency_key.clone(),
+            total_bytes: self.total_bytes,
+            sha256: self.sha256.clone(),
+        }
+    }
+
+    pub(crate) fn stream<F, E>(
+        self,
+        cancel: &Cancellation,
+        mut progress: F,
+        mut send: impl FnMut(PeerMessage) -> Result<(), E>,
+    ) -> Result<TransferOutcome, E>
+    where
+        F: FnMut(TransferProgress),
+        E: From<TransferError>,
+    {
+        let mut bytes = 0;
+        let mut files = 0;
+        for item in self.items {
+            if cancel.is_cancelled() {
+                let _ = send(PeerMessage::Cancel {
+                    transfer_id: self.transfer_id.clone(),
+                });
+                return Err(TransferError::Cancelled.into());
+            }
+            let relative = item.relative.to_string_lossy().into_owned();
+            if item.source.is_dir() {
+                send(PeerMessage::Directory {
+                    transfer_id: self.transfer_id.clone(),
+                    relative_path: relative,
+                })?;
+                continue;
+            }
+            send(PeerMessage::FileStart {
+                transfer_id: self.transfer_id.clone(),
+                relative_path: relative,
+                size: item.size,
+            })?;
+            let mut input = File::open(&item.source).map_err(TransferError::from)?;
+            let mut offset = 0;
+            let mut buffer = [0u8; CHUNK_SIZE];
+            loop {
+                if cancel.is_cancelled() {
+                    let _ = send(PeerMessage::Cancel {
+                        transfer_id: self.transfer_id.clone(),
+                    });
+                    return Err(TransferError::Cancelled.into());
+                }
+                let count = input.read(&mut buffer).map_err(TransferError::from)?;
+                if count == 0 {
+                    break;
+                }
+                send(PeerMessage::FileChunk {
+                    transfer_id: self.transfer_id.clone(),
+                    offset,
+                    bytes: buffer[..count].to_vec(),
+                })?;
+                offset += count as u64;
+                bytes += count as u64;
+                progress(TransferProgress {
+                    bytes,
+                    total_bytes: self.total_bytes,
+                });
+            }
+            send(PeerMessage::FileComplete {
+                transfer_id: self.transfer_id.clone(),
+            })?;
+            files += 1;
+        }
+        send(PeerMessage::TransferComplete {
+            transfer_id: self.transfer_id.clone(),
+        })?;
+        Ok(TransferOutcome {
+            bytes,
+            files,
+            sha256: self.sha256,
+        })
+    }
+}
+
+pub(crate) enum IncomingStart {
+    Ready(IncomingTransfer),
+    Completed(TransferOutcome),
+}
+
+pub(crate) struct IncomingTransfer {
+    engine: Arc<TransferEngine>,
+    transfer_id: String,
+    idempotency_key: String,
+    destination: PathPolicy,
+    total_bytes: u64,
+    expected_hash: String,
+    bytes: u64,
+    files: u64,
+    hash: Sha256,
+    active_file: Option<IncomingFile>,
+    targets: BTreeSet<PathBuf>,
+    committed_targets: Vec<PathBuf>,
+    completed: bool,
+}
+
+struct IncomingFile {
+    target: PathBuf,
+    temp: PathBuf,
+    file: File,
+    expected_size: u64,
+    offset: u64,
+}
+
+impl IncomingTransfer {
+    pub(crate) fn directory(
+        &mut self,
+        transfer_id: &str,
+        relative: &str,
+    ) -> Result<(), TransferError> {
+        self.require_id(transfer_id)?;
+        if self.active_file.is_some() {
+            return Err(TransferError::Protocol(
+                "directory arrived while a file is open",
+            ));
+        }
+        let target = self.destination.resolve(relative, PathOperation::Write)?;
+        if target.exists() && !target.is_dir() {
+            return Err(TransferError::DestinationExists(target));
+        }
+        fs::create_dir_all(target)?;
+        Ok(())
+    }
+
+    pub(crate) fn file_start(
+        &mut self,
+        transfer_id: &str,
+        relative: &str,
+        size: u64,
+    ) -> Result<(), TransferError> {
+        self.require_id(transfer_id)?;
+        if self.active_file.is_some() {
+            return Err(TransferError::Protocol(
+                "file started while another file is open",
+            ));
+        }
+        let target = self.destination.resolve(relative, PathOperation::Write)?;
+        if target.exists() || !self.targets.insert(target.clone()) {
+            return Err(TransferError::DestinationExists(target));
+        }
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let temp = temp_path(&target);
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)?;
+        self.active_file = Some(IncomingFile {
+            target,
+            temp,
+            file,
+            expected_size: size,
+            offset: 0,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn chunk(
+        &mut self,
+        transfer_id: &str,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), TransferError> {
+        self.require_id(transfer_id)?;
+        if bytes.len() > CHUNK_SIZE {
+            return Err(TransferError::Protocol(
+                "file chunk exceeds the protocol limit",
+            ));
+        }
+        let file = self
+            .active_file
+            .as_mut()
+            .ok_or(TransferError::Protocol("file chunk arrived without a file"))?;
+        if file.offset != offset {
+            return Err(TransferError::Protocol(
+                "file chunk offset is not monotonic",
+            ));
+        }
+        file.file.write_all(bytes)?;
+        file.offset += bytes.len() as u64;
+        if file.offset > file.expected_size {
+            return Err(TransferError::SizeMismatch);
+        }
+        self.bytes += bytes.len() as u64;
+        if self.bytes > self.total_bytes {
+            return Err(TransferError::SizeMismatch);
+        }
+        self.hash.update(bytes);
+        Ok(())
+    }
+
+    pub(crate) fn file_complete(&mut self, transfer_id: &str) -> Result<(), TransferError> {
+        self.require_id(transfer_id)?;
+        let file = self
+            .active_file
+            .take()
+            .ok_or(TransferError::Protocol("file completed without a file"))?;
+        if file.offset != file.expected_size {
+            let _ = fs::remove_file(&file.temp);
+            return Err(TransferError::SizeMismatch);
+        }
+        file.file.sync_all()?;
+        drop(file.file);
+        fs::rename(&file.temp, &file.target)?;
+        self.committed_targets.push(file.target);
+        self.files += 1;
+        Ok(())
+    }
+
+    pub(crate) fn complete(&mut self, transfer_id: &str) -> Result<TransferOutcome, TransferError> {
+        self.require_id(transfer_id)?;
+        if self.active_file.is_some() {
+            return Err(TransferError::Protocol(
+                "transfer completed while a file is open",
+            ));
+        }
+        if self.bytes != self.total_bytes {
+            return Err(TransferError::SizeMismatch);
+        }
+        let outcome = TransferOutcome {
+            bytes: self.bytes,
+            files: self.files,
+            sha256: hex(&self.hash.clone().finalize()),
+        };
+        if !outcome.sha256.eq_ignore_ascii_case(&self.expected_hash) {
+            return Err(TransferError::HashMismatch);
+        }
+        self.engine
+            .completed
+            .lock()
+            .unwrap()
+            .insert(self.idempotency_key.clone(), outcome.clone());
+        self.completed = true;
+        Ok(outcome)
+    }
+
+    fn require_id(&self, transfer_id: &str) -> Result<(), TransferError> {
+        if self.transfer_id == transfer_id {
+            Ok(())
+        } else {
+            Err(TransferError::Protocol(
+                "message belongs to a different transfer",
+            ))
+        }
+    }
+}
+
+impl Drop for IncomingTransfer {
+    fn drop(&mut self) {
+        if let Some(file) = self.active_file.take() {
+            let _ = fs::remove_file(file.temp);
+        }
+        if !self.completed {
+            for target in self.committed_targets.iter().rev() {
+                let _ = fs::remove_file(target);
+            }
+        }
+    }
+}
+
 /// A cancellable token suitable for local API handlers and UI clients.
 #[derive(Debug, Clone, Default)]
 pub struct Cancellation(Arc<AtomicBool>);
@@ -260,10 +609,9 @@ fn collect_items(
     if !metadata.is_dir() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "unsupported source").into());
     }
-    // Validate every discovered path through the shared capability, including directory names.
     policy.resolve(relative, PathOperation::Read)?;
     let mut entries = fs::read_dir(path)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|e| e.file_name());
+    entries.sort_by_key(|entry| entry.file_name());
     for entry in entries {
         let child = relative.join(entry.file_name());
         let child_path = policy.resolve(&child, PathOperation::Read)?;
@@ -275,6 +623,22 @@ fn collect_items(
         size: 0,
     });
     Ok(())
+}
+
+fn hash_items(items: &[FileItem]) -> Result<String, TransferError> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; CHUNK_SIZE];
+    for item in items.iter().filter(|item| item.source.is_file()) {
+        let mut file = File::open(&item.source)?;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&buffer[..count]);
+        }
+    }
+    Ok(hex(&hash.finalize()))
 }
 
 fn copy_file<F>(
@@ -324,7 +688,7 @@ fn temp_path(target: &Path) -> PathBuf {
     target.with_extension(format!("agent-send-{stamp}-{}.part", std::process::id()))
 }
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]

@@ -8,9 +8,10 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "check:deployment": "node scripts/check-deployment.mjs",
+    "stage:dev": "node scripts/stage-dev.mjs",
     "release:manifest": "node scripts/create-release-manifest.mjs src-tauri/target/release/bundle release",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
+    "tauri:dev": "npm run stage:dev && tauri dev",
     "tauri:build": "tauri build"
   },
   "dependencies": {

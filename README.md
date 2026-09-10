@@ -102,6 +102,6 @@ never falls back to unauthenticated transport.
 ## Planned clients
 
 1. Desktop tray app (macOS, Windows, Linux)
-2. CLI (`agent-send health`, `agent-send peers`, `agent-send send`, `agent-send demo`)
+2. CLI (`agent-send health`, `agent-send peers`, `agent-send send`, `agent-send status`, `agent-send cancel`, `agent-send demo`)
 3. Local agent API / MCP adapter
 4. Mobile clients, if the protocol proves useful beyond laptops

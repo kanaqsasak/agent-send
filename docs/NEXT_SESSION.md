@@ -43,10 +43,11 @@ the popover; blur hides it. Right-click exposes About and Quit.
 1. Test native behavior and installers on actual Windows and Linux hosts.
 2. Configure real signing/notarization credentials and verify release artifacts.
 3. Replace placeholder app branding if the radar mark is not accepted.
-4. Add a first-class CLI command for receiving/cancelling and richer progress output; `agent-send send` now submits an authenticated transfer to an independently running daemon and waits for the socket delivery result.
+4. Add richer CLI progress output; `agent-send send`, `status`, and `cancel` now expose authenticated transfer lifecycle commands, while sends wait for the socket delivery result.
 5. Review pairing UX and secret storage for production; trusted-peer secrets are currently protected by owner-only local JSON files, not an OS credential store.
 6. Run LAN tests across two physical laptops, including firewall, Wi-Fi isolation, sleep/wake, and interface changes.
 7. Reconcile stale milestone checkboxes in `PLAN.md` only after the corresponding exit criteria are verified.
+8. Validate installers, signing, credential-store integration, and physical cross-platform/LAN behavior on actual target hosts; these cannot be proven from this macOS checkout.
 
 Do not claim cross-platform runtime or installer support based only on the macOS
 checks above.

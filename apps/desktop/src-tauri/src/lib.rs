@@ -56,8 +56,12 @@ fn start_daemon(app: &tauri::AppHandle) {
         return;
     };
     match Command::new(&path).args(["--bind", DAEMON_BIND]).spawn() {
-        Ok(child) => app.manage(DaemonProcess(Mutex::new(Some(child)))),
-        Err(error) => eprintln!("agent-send: failed to launch {}: {error}", path.display()),
+        Ok(child) => {
+            app.manage(DaemonProcess(Mutex::new(Some(child))));
+        }
+        Err(error) => {
+            eprintln!("agent-send: failed to launch {}: {error}", path.display());
+        }
     }
 }
 

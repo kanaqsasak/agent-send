@@ -2021,11 +2021,7 @@ mod tests {
         response
     }
 
-    fn agent_request_with_origin(
-        addr: SocketAddr,
-        token: &str,
-        origin: Option<&str>,
-    ) -> String {
+    fn agent_request_with_origin(addr: SocketAddr, token: &str, origin: Option<&str>) -> String {
         let body = serde_json::json!({ "operation": "peers.list", "params": {} }).to_string();
         let origin_header = origin
             .map(|origin| format!("Origin: {origin}\r\n"))
@@ -2055,13 +2051,8 @@ mod tests {
         let advertisement = serde_json::to_string(&advertisement("cors-peer")).unwrap();
         let evil = Some("https://evil.example");
 
-        let rejected = local_request_with_origin(
-            addr,
-            "POST",
-            "/v1/pairings",
-            &advertisement,
-            evil,
-        );
+        let rejected =
+            local_request_with_origin(addr, "POST", "/v1/pairings", &advertisement, evil);
         assert!(rejected.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(rejected.contains("origin_not_allowed"));
         assert!(daemon.peers().is_empty());
@@ -2106,13 +2097,8 @@ mod tests {
         assert!(rejected_agent.starts_with("HTTP/1.1 403 Forbidden"));
         assert_eq!(running.audit_entries().len(), audit_before);
 
-        let rejected_revoke = local_request_with_origin(
-            addr,
-            "DELETE",
-            "/v1/peers/cors-peer",
-            "",
-            evil,
-        );
+        let rejected_revoke =
+            local_request_with_origin(addr, "DELETE", "/v1/peers/cors-peer", "", evil);
         assert!(rejected_revoke.starts_with("HTTP/1.1 403 Forbidden"));
         assert!(daemon.peers()[0].trusted);
 

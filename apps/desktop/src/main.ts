@@ -65,10 +65,6 @@ app.innerHTML = `
     <header class="titlebar" data-tauri-drag-region>
       <span class="app-mark" aria-hidden="true">↗</span>
       <span class="app-name">agent-send</span>
-      <div class="titlebar-actions" data-tauri-drag-region="false">
-        <button id="hide-window" class="icon-button" type="button" title="Hide to tray" aria-label="Hide to tray">—</button>
-        <button id="close-window" class="icon-button window-control" type="button" title="Close to tray" aria-label="Close to tray">×</button>
-      </div>
     </header>
 
     <main class="content">
@@ -276,15 +272,12 @@ async function checkHealth() {
 function showAbout() { aboutElement.hidden = false; document.querySelector<HTMLButtonElement>("#close-about")?.focus(); }
 function hideAbout() { aboutElement.hidden = true; document.querySelector<HTMLButtonElement>("#open-about")?.focus(); }
 function hideWindow() { void nativeWindow.hide().catch(() => window.close()); }
-function closeWindow() { void nativeWindow.close().catch(hideWindow); }
 
 void invoke<string>("app_version").then((value) => {
   version.textContent = `v${value}`;
   aboutVersion.textContent = `agent-send v${value}`;
 }).catch(() => { aboutVersion.textContent = "Development build"; });
 
-document.querySelector("#hide-window")?.addEventListener("click", hideWindow);
-document.querySelector("#close-window")?.addEventListener("click", closeWindow);
 refreshButton.addEventListener("click", () => void checkHealth());
 document.querySelector("#open-about")?.addEventListener("click", showAbout);
 document.querySelector("#close-about")?.addEventListener("click", hideAbout);

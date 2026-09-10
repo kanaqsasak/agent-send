@@ -50,22 +50,23 @@ button:focus-visible, input:focus-visible {
 .titlebar {
   display: flex;
   align-items: center;
-  min-height: 39px;
+  min-height: 44px;
   padding: 0 8px 0 13px;
-  border-bottom: 1px solid var(--border-subtle);
+  background: #252a33;
+  border-bottom: 1px solid #353c48;
   user-select: none;
   cursor: default;
 }
 .app-mark {
   display: grid;
-  width: 20px;
-  height: 20px;
-  margin-right: 7px;
+  width: 26px;
+  height: 26px;
+  margin-right: 8px;
   place-items: center;
-  color: var(--accent);
+  color: #fff;
 }
-.app-mark svg { display: block; width: 16px; height: 16px; }
-.app-name { color: var(--text); font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
+.app-mark svg { display: block; width: 24px; height: 24px; }
+.app-name { color: #fff; font-size: 13px; font-weight: 650; letter-spacing: -.01em; }
 .titlebar-actions { display: flex; margin-left: auto; }
 
 .icon-button {

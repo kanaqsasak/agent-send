@@ -60,7 +60,9 @@ jobs:
         id: version
         working-directory: apps/desktop
         shell: bash
-        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - name: Install frontend dependencies
         working-directory: apps/desktop
         run: npm ci
@@ -106,7 +108,8 @@ jobs:
           WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: node -e 'const names = ["APPLE_CERTIFICATE","APPLE_CERTIFICATE_PASSWORD","APPLE_SIGNING_IDENTITY","APPLE_ID","APPLE_PASSWORD","APPLE_TEAM_ID","WINDOWS_CERTIFICATE","WINDOWS_CERTIFICATE_PASSWORD","TAURI_SIGNING_PRIVATE_KEY","TAURI_SIGNING_PRIVATE_KEY_PASSWORD"]; for (const name of names) console.log(name + "=" + (process.env[name] ? "configured" : "not configured"))'
+        run: >-
+          node -e 'const names = ["APPLE_CERTIFICATE","APPLE_CERTIFICATE_PASSWORD","APPLE_SIGNING_IDENTITY","APPLE_ID","APPLE_PASSWORD","APPLE_TEAM_ID","WINDOWS_CERTIFICATE","WINDOWS_CERTIFICATE_PASSWORD","TAURI_SIGNING_PRIVATE_KEY","TAURI_SIGNING_PRIVATE_KEY_PASSWORD"]; for (const name of names) console.log(name + "=" + (process.env[name] ? "configured" : "not configured"))'
       - name: Build Tauri bundles
         working-directory: apps/desktop
         run: npm run tauri:build -- --bundles ${{ matrix.bundles }}

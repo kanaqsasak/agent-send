@@ -9,7 +9,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-const HELP: &str = "agent-send\n\nUSAGE:\n    agent-send --help\n    agent-send health --addr HOST:PORT\n    agent-send peers --addr HOST:PORT\n    agent-send send --addr HOST:PORT --token TOKEN --peer-id ID --source-folder ID --destination-folder ID --path PATH --idempotency-key KEY\n    agent-send demo\n";
+const HELP: &str = "agent-send\n\nUSAGE:\n    agent-send --help\n    agent-send health --addr HOST:PORT\n    agent-send peers --addr HOST:PORT\n    agent-send send --addr HOST:PORT --token TOKEN --peer-id ID --source-folder ID --destination-folder ID --path PATH --idempotency-key KEY\n    agent-send status --addr HOST:PORT --token TOKEN --transfer-id ID\n    agent-send cancel --addr HOST:PORT --token TOKEN --transfer-id ID\n    agent-send demo\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
@@ -28,6 +28,16 @@ pub enum Command {
         source_paths: Vec<String>,
         destination_folder_id: String,
         idempotency_key: String,
+    },
+    Status {
+        addr: SocketAddr,
+        token: String,
+        transfer_id: String,
+    },
+    Cancel {
+        addr: SocketAddr,
+        token: String,
+        transfer_id: String,
     },
     Demo,
 }
@@ -70,8 +80,14 @@ where
         args if args.first().is_some_and(|command| command == "send") => {
             parse_send_args(&args[1..])
         }
+        args if args.first().is_some_and(|command| command == "status") => {
+            parse_transfer_args(&args[1..], false)
+        }
+        args if args.first().is_some_and(|command| command == "cancel") => {
+            parse_transfer_args(&args[1..], true)
+        }
         _ => Err(ParseError(
-            "usage: agent-send {--help|health|peers} --addr HOST:PORT, send ..., or demo".into(),
+            "usage: agent-send {--help|health|peers} --addr HOST:PORT, send ..., status ..., cancel ..., or demo".into(),
         )),
     }
 }
@@ -134,6 +150,55 @@ fn parse_send_args(args: &[String]) -> Result<Command, ParseError> {
     })
 }
 
+fn parse_transfer_args(args: &[String], cancel: bool) -> Result<Command, ParseError> {
+    let mut addr: Option<SocketAddr> = None;
+    let mut token = None;
+    let mut transfer_id = None;
+    let command = if cancel { "cancel" } else { "status" };
+
+    let mut index = 0;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        let value = args
+            .get(index + 1)
+            .ok_or_else(|| ParseError(format!("{flag} requires a value")))?;
+        match flag {
+            "--addr" => {
+                addr = Some(
+                    value
+                        .parse()
+                        .map_err(|_| ParseError("--addr must be HOST:PORT".into()))?,
+                )
+            }
+            "--token" => token = Some(value.clone()),
+            "--transfer-id" => transfer_id = Some(value.clone()),
+            _ => return Err(ParseError(format!("unknown {command} option: {flag}"))),
+        }
+        index += 2;
+    }
+
+    let addr = addr.ok_or_else(|| ParseError(format!("{command} requires --addr")))?;
+    if !addr.ip().is_loopback() {
+        return Err(ParseError("--addr must be a loopback address".into()));
+    }
+    let token = token.ok_or_else(|| ParseError(format!("{command} requires --token")))?;
+    let transfer_id =
+        transfer_id.ok_or_else(|| ParseError(format!("{command} requires --transfer-id")))?;
+    if cancel {
+        Ok(Command::Cancel {
+            addr,
+            token,
+            transfer_id,
+        })
+    } else {
+        Ok(Command::Status {
+            addr,
+            token,
+            transfer_id,
+        })
+    }
+}
+
 fn request(addr: SocketAddr, path: &str) -> Result<String, Box<dyn Error>> {
     if !addr.ip().is_loopback() {
         return Err(ParseError("--addr must be a loopback address".into()).into());
@@ -176,6 +241,30 @@ pub fn run(command: Command) -> Result<(), Box<dyn Error>> {
                 "peer_id": peer_id, "source_folder_id": source_folder_id, "source_paths": source_paths,
                 "destination_folder_id": destination_folder_id, "idempotency_key": idempotency_key
             }}).to_string();
+            println!("{}", post_agent(addr, &token, &body)?);
+        }
+        Command::Status {
+            addr,
+            token,
+            transfer_id,
+        } => {
+            let body = serde_json::json!({
+                "operation": "transfers.status",
+                "params": {"transfer_id": transfer_id}
+            })
+            .to_string();
+            println!("{}", post_agent(addr, &token, &body)?);
+        }
+        Command::Cancel {
+            addr,
+            token,
+            transfer_id,
+        } => {
+            let body = serde_json::json!({
+                "operation": "transfers.cancel",
+                "params": {"transfer_id": transfer_id}
+            })
+            .to_string();
             println!("{}", post_agent(addr, &token, &body)?);
         }
         Command::Demo => {
@@ -314,6 +403,48 @@ mod tests {
             matches!(command, Command::Send { source_paths, .. } if source_paths == ["file.txt"])
         );
         assert!(parse_args(["send", "--addr", "127.0.0.1:1"]).is_err());
+
+        assert_eq!(
+            parse_args([
+                "status",
+                "--token",
+                "secret",
+                "--transfer-id",
+                "local-1",
+                "--addr",
+                "127.0.0.1:1",
+            ])
+            .unwrap(),
+            Command::Status {
+                addr: "127.0.0.1:1".parse().unwrap(),
+                token: "secret".into(),
+                transfer_id: "local-1".into(),
+            }
+        );
+        assert!(matches!(
+            parse_args([
+                "cancel",
+                "--addr",
+                "127.0.0.1:1",
+                "--token",
+                "secret",
+                "--transfer-id",
+                "local-1",
+            ])
+            .unwrap(),
+            Command::Cancel { .. }
+        ));
+        assert!(parse_args([
+            "status",
+            "--addr",
+            "8.8.8.8:53",
+            "--token",
+            "secret",
+            "--transfer-id",
+            "local-1"
+        ])
+        .is_err());
+        assert!(parse_args(["cancel", "--addr", "127.0.0.1:1", "--token", "secret"]).is_err());
     }
 
     #[test]

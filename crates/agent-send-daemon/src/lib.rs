@@ -993,6 +993,7 @@ fn handle_connection(
     let first_line = head.lines().next().unwrap_or_default();
     let method_path = first_line.split_whitespace().take(2).collect::<Vec<_>>();
     let (status, body) = match (method_path.first().copied(), method_path.get(1).copied()) {
+        (Some("OPTIONS"), _) => ("204 No Content", String::new()),
         (Some("GET"), Some("/v1/health")) => (
             "200 OK",
             serde_json::to_string(&HealthResponse {
@@ -1091,7 +1092,7 @@ fn handle_connection(
         _ => ("404 Not Found", "{\"error\":\"not_found\"}".to_owned()),
     };
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\nAccess-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());

@@ -1,0 +1,99 @@
+name: Package desktop
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    name: ${{ matrix.platform }} bundle
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: macos
+            bundles: app,dmg
+          - os: windows-latest
+            platform: windows
+            bundles: nsis,msi
+          - os: ubuntu-22.04
+            platform: linux
+            bundles: appimage,deb,rpm
+    env:
+      # These are intentionally optional. Native signing is only enabled when
+      # the corresponding repository secrets have been configured.
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux Tauri prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            build-essential curl wget file libssl-dev \
+            libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf
+      - name: Read app version
+        id: version
+        working-directory: apps/desktop
+        shell: bash
+        run: echo "version=$(node -p \"require('./package.json').version\")" >> "$GITHUB_OUTPUT"
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Build frontend
+        working-directory: apps/desktop
+        run: npm run build
+      - name: Build release sidecars (Unix)
+        if: runner.os != 'Windows'
+        working-directory: apps/desktop
+        shell: bash
+        run: |
+          set -eu
+          cargo build --release --bin agent-send-daemon --bin agent-send-cli --bin agent-send-mcp
+          target="$(rustc -vV | awk '/^host: / {print $2}')"
+          mkdir -p src-tauri/binaries
+          cp "../../target/release/agent-send-daemon" "src-tauri/binaries/agent-send-daemon-${target}"
+          cp "../../target/release/agent-send-cli" "src-tauri/binaries/agent-send-cli-${target}"
+          cp "../../target/release/agent-send-mcp" "src-tauri/binaries/agent-send-mcp-${target}"
+      - name: Build release sidecars (Windows)
+        if: runner.os == 'Windows'
+        working-directory: apps/desktop
+        shell: pwsh
+        run: |
+          cargo build --release --bin agent-send-daemon --bin agent-send-cli --bin agent-send-mcp
+          $target = (rustc -vV | Select-String '^host:').ToString().Split()[1]
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          Copy-Item ../../target/release/agent-send-daemon.exe "src-tauri/binaries/agent-send-daemon-$target.exe"
+          Copy-Item ../../target/release/agent-send-cli.exe "src-tauri/binaries/agent-send-cli-$target.exe"
+          Copy-Item ../../target/release/agent-send-mcp.exe "src-tauri/binaries/agent-send-mcp-$target.exe"
+      - name: Build Tauri bundles
+        working-directory: apps/desktop
+        run: npm run tauri:build -- --bundles ${{ matrix.bundles }}
+      - name: Upload versioned bundles
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-send-${{ steps.version.outputs.version }}-${{ matrix.platform }}-${{ runner.arch }}
+          path: apps/desktop/src-tauri/target/release/bundle/
+          if-no-files-found: error

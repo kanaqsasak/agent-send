@@ -37,27 +37,55 @@ npm run tauri:build           # build host-platform installer(s)
 npx tauri info                # inspect native prerequisites and target
 ```
 
-`tauri:build` produces the host platform's configured formats:
+The Tauri bundle targets are configured for all three platforms:
 
 - macOS: `.app` and `.dmg` (`npm run tauri:build -- --bundles app,dmg`)
 - Windows: NSIS `.exe` and MSI (`npm run tauri:build -- --bundles nsis,msi`)
 - Linux: AppImage, `.deb`, and `.rpm` (`npm run tauri:build -- --bundles appimage,deb,rpm`)
 
-The shell starts hidden in the Tauri configuration. A normal launch shows the
-window; the autostart plugin passes `--hidden`, leaving only the tray visible.
-Closing the window hides it, while the tray Quit action exits the shell. The
-tray and autostart integration are configured, but the daemon is intentionally
-an external per-user service: the lifecycle seam does not start or stop a
-process until the daemon's packaging contract is defined. `AGENT_SEND_DAEMON_URL`
-can still point the shell at a separately managed daemon.
+### Native prerequisites
 
-The checked-in PNGs under `src-tauri/icons` are functional placeholder branding.
-Replace them before release and add platform signing assets. Signing,
-notarization, update feeds, and a bundled daemon are not configured.
+Build on the target OS (the packaging workflow uses native GitHub-hosted
+runners). In addition to Node.js 20+ and Rust stable:
 
-Packaging is native-build only: build macOS on macOS, Windows on Windows, and
-Linux on Linux (or use a separately validated cross-build/CI image). Linux
-WebKitGTK/AppIndicator packages and Windows WebView2 are runtime prerequisites;
-macOS first launch may require the usual Gatekeeper approval for unsigned apps.
-Firewall prompts, service registration, and signed release behavior remain
-platform validation work.
+- macOS: Xcode Command Line Tools and a macOS 10.15+ SDK.
+- Windows: Microsoft C++ Build Tools (Desktop development with C++), WebView2,
+  and PowerShell.
+- Linux: `webkit2gtk-4.1`, `libayatana-appindicator3`, GTK, `librsvg2`,
+  `patchelf`, `build-essential`, `curl`, `wget`, `file`, and `libssl-dev`
+  development packages (the exact package names vary by distro).
+
+### Daemon and CLI/MCP payloads
+
+`src-tauri/tauri.conf.json` declares the daemon, CLI, and MCP adapter as Tauri
+`externalBin` sidecars. No binaries are checked in or fabricated. A release
+build must first compile each Rust binary in release mode, then copy it to
+`src-tauri/binaries/<name>-<rust-target>` (and add `.exe` on Windows); Tauri
+includes the matching target in the installer. The daemon is the runtime
+service; CLI and MCP are optional executable companions for integrations. The
+current shell still treats the daemon as an external per-user service and does
+not launch or supervise these sidecars. Consequently, shipping the files does
+not yet provide service registration, upgrades, or a complete pairing UX.
+
+The packaging workflow performs this staging and names uploaded artifacts with
+the app version, platform, and runner architecture. It never commits staged
+binaries. Local `tauri:build` requires the three staged files; `npm run build`
+does not.
+
+### Signing and notarization
+
+The workflow accepts (but does not invent) these repository or environment
+secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD`, `APPLE_TEAM_ID`,
+`WINDOWS_CERTIFICATE`, `WINDOWS_CERTIFICATE_PASSWORD`, and
+`TAURI_SIGNING_PRIVATE_KEY`/`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` for future
+update artifacts. Configure them in GitHub Actions before publishing; builds
+without them remain unsigned. Never put certificates, private keys, or Apple
+credentials in this repository. Linux artifacts are not signed by this
+workflow.
+
+The checked-in PNGs under `src-tauri/icons` are functional placeholder branding
+and must be replaced before a public release. Firewall prompts, service
+registration, update feeds, and cross-platform runtime testing remain known
+limitations. Windows WebView2 and Linux WebKitGTK/AppIndicator packages are
+runtime prerequisites; unsigned macOS builds may require Gatekeeper approval.

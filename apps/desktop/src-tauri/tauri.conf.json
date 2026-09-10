@@ -33,6 +33,11 @@
     "category": "Utility",
     "shortDescription": "Private local file transfer",
     "longDescription": "A private, local-first file transfer tray service.",
+    "externalBin": [
+      "binaries/agent-send-daemon",
+      "binaries/agent-send-cli",
+      "binaries/agent-send-mcp"
+    ],
     "linux": {
       "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] }
     },

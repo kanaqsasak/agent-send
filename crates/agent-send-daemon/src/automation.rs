@@ -252,6 +252,8 @@ pub struct FoldersResponse {
 #[serde(rename_all = "snake_case")]
 pub enum AgentTransferState {
     Submitted,
+    Completed,
+    Failed,
     Cancelled,
 }
 
@@ -259,6 +261,8 @@ pub enum AgentTransferState {
 pub struct AgentTransferStatus {
     pub transfer_id: String,
     pub state: AgentTransferState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,9 +272,7 @@ struct AgentTransfer {
     idempotency_key: String,
 }
 
-/// Tracks validated agent submissions until a peer transport accepts them.
-/// The current daemon has no socket-backed peer transport, so `Submitted` is
-/// intentionally distinct from completed file delivery.
+/// Tracks validated agent submissions and the result of socket delivery.
 #[derive(Debug, Default)]
 pub struct AgentTransfers {
     state: Mutex<AgentTransferStateStore>,
@@ -301,6 +303,7 @@ impl AgentTransfers {
         let status = AgentTransferStatus {
             transfer_id: format!("local-{}", state.next_id),
             state: AgentTransferState::Submitted,
+            error: None,
         };
         state.transfers.insert(
             status.transfer_id.clone(),
@@ -311,6 +314,23 @@ impl AgentTransfers {
             },
         );
         Ok(status)
+    }
+
+    pub fn complete(
+        &self,
+        actor: &AuthorizedAgent,
+        transfer_id: &str,
+    ) -> Result<AgentTransferStatus, AutomationError> {
+        self.update_result(actor, transfer_id, AgentTransferState::Completed, None)
+    }
+
+    pub fn fail(
+        &self,
+        actor: &AuthorizedAgent,
+        transfer_id: &str,
+        error: impl Into<String>,
+    ) -> Result<AgentTransferStatus, AutomationError> {
+        self.update_result(actor, transfer_id, AgentTransferState::Failed, Some(error.into()))
     }
 
     pub fn status(
@@ -333,7 +353,32 @@ impl AgentTransfers {
             .get_mut(transfer_id)
             .filter(|transfer| transfer.actor_id == actor.id)
             .ok_or(AutomationError::TransferNotFound)?;
-        transfer.status.state = AgentTransferState::Cancelled;
+        if matches!(
+            transfer.status.state,
+            AgentTransferState::Submitted
+        ) {
+            transfer.status.state = AgentTransferState::Cancelled;
+        }
+        Ok(transfer.status.clone())
+    }
+
+    fn update_result(
+        &self,
+        actor: &AuthorizedAgent,
+        transfer_id: &str,
+        state_value: AgentTransferState,
+        error: Option<String>,
+    ) -> Result<AgentTransferStatus, AutomationError> {
+        let mut state = self.state.lock().unwrap();
+        let transfer = state
+            .transfers
+            .get_mut(transfer_id)
+            .filter(|transfer| transfer.actor_id == actor.id)
+            .ok_or(AutomationError::TransferNotFound)?;
+        if matches!(transfer.status.state, AgentTransferState::Submitted) {
+            transfer.status.state = state_value;
+            transfer.status.error = error;
+        }
         Ok(transfer.status.clone())
     }
 

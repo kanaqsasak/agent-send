@@ -556,23 +556,11 @@ impl Daemon {
         if request.peer_id != peer_id {
             return Err(DaemonError::UntrustedPeer(peer_id.to_owned()));
         }
-        let address = self
-            .registry
-            .lock()
-            .unwrap()
-            .peers
-            .get(peer_id)
-            .filter(|record| record.trusted)
-            .ok_or_else(|| DaemonError::UntrustedPeer(peer_id.to_owned()))?
-            .advertisement
-            .address
-            .parse::<SocketAddr>()
-            .map_err(|_| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
-        let channel = self.secure_peer_channel(peer_id)?;
-        Ok(send_socket_transfer(
+        Ok(send_agent_socket_transfer(
+            &self.identity,
+            &self.registry,
             &self.transfer,
-            channel,
-            address,
+            peer_id,
             request,
             cancel,
             progress,
@@ -1015,6 +1003,7 @@ fn handle_connection(
             )
         }
         (Some("POST"), Some("/v1/agent")) => handle_agent_request(
+            identity,
             head,
             body,
             registry,
@@ -1111,7 +1100,44 @@ struct TransferIdParams {
     transfer_id: String,
 }
 
+fn send_agent_socket_transfer<F>(
+    identity: &LocalIdentity,
+    registry: &Arc<Mutex<PeerRegistry>>,
+    transfer: &TransferEngine,
+    peer_id: &str,
+    request: &agent_send_core::TransferRequest,
+    cancel: &Cancellation,
+    progress: F,
+) -> Result<TransferOutcome, DaemonError>
+where
+    F: FnMut(TransferProgress),
+{
+    if request.peer_id != peer_id {
+        return Err(DaemonError::UntrustedPeer(peer_id.to_owned()));
+    }
+    let (address, paired_peer) = {
+        let registry = registry.lock().unwrap();
+        let record = registry
+            .peers
+            .get(peer_id)
+            .filter(|record| record.trusted)
+            .ok_or_else(|| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
+        let address = record
+            .advertisement
+            .address
+            .parse::<SocketAddr>()
+            .map_err(|_| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
+        let paired_peer = registry
+            .paired_peer(peer_id)
+            .ok_or_else(|| DaemonError::UntrustedPeer(peer_id.to_owned()))?;
+        (address, paired_peer)
+    };
+    let channel = SecurePeerChannel::new(identity.id.clone(), paired_peer)?;
+    Ok(send_socket_transfer(transfer, channel, address, request, cancel, progress)?)
+}
+
 fn handle_agent_request(
+    identity: &LocalIdentity,
     head: &str,
     body: &str,
     registry: &Arc<Mutex<PeerRegistry>>,
@@ -1179,6 +1205,7 @@ fn handle_agent_request(
             .expect("folder response serializes"))
         }
         "transfers.submit" | "transfers.send" => {
+            let is_send = operation == "transfers.send";
             let submission =
                 match serde_json::from_value::<agent_send_core::TransferRequest>(request.params) {
                     Ok(submission) => submission,
@@ -1198,6 +1225,25 @@ fn handle_agent_request(
                 &registry.lock().unwrap().list(),
                 transfer,
             );
+            let result = result.and_then(|status| {
+                if !is_send || status.state != AgentTransferState::Submitted {
+                    return Ok(status);
+                }
+                let transfer_id = status.transfer_id.clone();
+                let cancellation = Cancellation::new();
+                match send_agent_socket_transfer(
+                    identity,
+                    registry,
+                    transfer,
+                    &submission.peer_id,
+                    &submission,
+                    &cancellation,
+                    |_| {},
+                ) {
+                    Ok(_) => agent_transfers.complete(&actor, &transfer_id),
+                    Err(error) => agent_transfers.fail(&actor, &transfer_id, error.to_string()),
+                }
+            });
             audit.record(
                 actor_id,
                 operation,
@@ -1207,7 +1253,11 @@ fn handle_agent_request(
                     .as_ref()
                     .ok()
                     .map(|status| status.transfer_id.clone()),
-                if result.is_ok() { "ok" } else { "denied" },
+                if !is_send || result
+                    .as_ref()
+                    .map(|status| status.state == AgentTransferState::Completed)
+                    .unwrap_or(false)
+                { "ok" } else { "denied" },
             );
             result.and_then(|status| {
                 serde_json::to_value(status)
@@ -1621,6 +1671,14 @@ mod tests {
         );
 
         let receiver_running = receiver.start().unwrap();
+        let sender_token = sender
+            .issue_agent_token(AgentScope {
+                peer_ids: [receiver_advertisement.id.clone()].into_iter().collect(),
+                folder_ids: ["source".into(), "destination".into(), "read-only".into()]
+                    .into_iter()
+                    .collect(),
+            })
+            .unwrap();
         let sender_running = sender.start().unwrap();
         let request = agent_send_core::TransferRequest {
             peer_id: receiver_advertisement.id.clone(),
@@ -1642,15 +1700,24 @@ mod tests {
             Err(DaemonError::SocketTransfer(SocketTransferError::Rejected))
         ));
         assert!(!destination_root.join("nested/file.txt").exists());
-        let outcome = sender
-            .send_to_peer_socket(
-                &receiver_advertisement.id,
-                &request,
-                &Cancellation::new(),
-                |_| {},
-            )
-            .unwrap();
-        assert_eq!(outcome.bytes, b"authenticated socket transfer".len() as u64);
+        denied_request.idempotency_key = "socket-transfer-denied-agent".into();
+        let failed = agent_request(
+            sender_running.local_addr(),
+            Some(&sender_token.token),
+            "transfers.send",
+            serde_json::to_value(&denied_request).unwrap(),
+        );
+        assert!(failed.starts_with("HTTP/1.1 200 OK"), "{failed}");
+        assert!(failed.contains("\"state\":\"failed\""), "{failed}");
+        assert!(failed.contains("\"error\":"), "{failed}");
+        let sent = agent_request(
+            sender_running.local_addr(),
+            Some(&sender_token.token),
+            "transfers.send",
+            serde_json::to_value(&request).unwrap(),
+        );
+        assert!(sent.starts_with("HTTP/1.1 200 OK"), "{sent}");
+        assert!(sent.contains("\"state\":\"completed\""), "{sent}");
         assert_eq!(
             fs::read(destination_root.join("nested/file.txt")).unwrap(),
             b"authenticated socket transfer"
@@ -1658,6 +1725,7 @@ mod tests {
         sender_running.shutdown().unwrap();
         receiver_running.shutdown().unwrap();
         let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(sender_identity.with_extension("agent-tokens.json"));
     }
 
     #[test]

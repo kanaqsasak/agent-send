@@ -8,7 +8,7 @@ use std::{
 use tauri::{
     menu::{Menu, MenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Manager, PhysicalPosition, Position, RunEvent, Size,
+    Emitter, Manager, PhysicalPosition, PhysicalSize, Position, RunEvent, Size,
 };
 
 const HIDDEN_FLAG: &str = "--hidden";
@@ -129,7 +129,10 @@ pub fn run() {
                     }
                 })
                 .on_menu_event(|app, event| match event.id().as_ref() {
-                    "about" => show_window(app),
+                    "about" => {
+                        show_window(app);
+                        let _ = app.emit("agent-send://show-about", ());
+                    }
                     "quit" => app.exit(0),
                     _ => {}
                 })
@@ -164,15 +167,35 @@ fn show_window_at(app: &tauri::AppHandle, rect: tauri::Rect) {
         // Position the popover below the tray icon. This keeps the interaction
         // anchored to the tray on menu-bar systems; the UI remains usable on
         // platforms where tray geometry is unavailable.
-        let (x, y) = match (rect.position, rect.size) {
-            (Position::Physical(position), Size::Physical(size)) => {
-                (position.x - 330, position.y + size.height as i32 + 8)
-            }
+        let (position, tray_size) = match (rect.position, rect.size) {
+            (Position::Physical(position), Size::Physical(size)) => (position, size),
             _ => {
                 show_window(app);
                 return;
             }
         };
+        let popover_size = window
+            .outer_size()
+            .unwrap_or_else(|_| PhysicalSize::new(396, 540));
+        let width = i32::try_from(popover_size.width).unwrap_or(396);
+        let height = i32::try_from(popover_size.height).unwrap_or(540);
+        let tray_width = i32::try_from(tray_size.width).unwrap_or_default();
+        let tray_height = i32::try_from(tray_size.height).unwrap_or_default();
+        let mut x = position.x + tray_width / 2 - width / 2;
+        let mut y = position.y + tray_height + 8;
+
+        // A taskbar can be at any edge. Keep the compact popover within the
+        // monitor work area, preferring the side opposite the tray if needed.
+        if let Ok(Some(monitor)) = app.monitor_from_point(position.x as f64, position.y as f64) {
+            let work_area = monitor.work_area();
+            let right = work_area.position.x + i32::try_from(work_area.size.width).unwrap_or(i32::MAX);
+            let bottom = work_area.position.y + i32::try_from(work_area.size.height).unwrap_or(i32::MAX);
+            x = x.clamp(work_area.position.x, right.saturating_sub(width));
+            if y.saturating_add(height) > bottom {
+                y = position.y.saturating_sub(height + 8);
+            }
+            y = y.clamp(work_area.position.y, bottom.saturating_sub(height));
+        }
         let _ = window.set_position(PhysicalPosition::new(x, y));
         let _ = window.show();
         let _ = window.set_focus();

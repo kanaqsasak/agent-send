@@ -13,8 +13,8 @@
     "windows": [
       {
         "title": "agent-send",
-        "width": 360,
-        "height": 240,
+        "width": 396,
+        "height": 540,
         "resizable": false,
         "decorations": false,
         "shadow": true,

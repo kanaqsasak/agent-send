@@ -1,7 +1,7 @@
 use std::{
-    fs,
+    fs::{self, OpenOptions},
     path::{Path, PathBuf},
-    process::{Child, Command},
+    process::{Child, Command, Stdio},
     sync::Mutex,
 };
 
@@ -31,20 +31,27 @@ fn app_version() -> &'static str {
 }
 
 fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
-    let directories = [resource_dir.to_path_buf(), resource_dir.join("binaries")];
-    directories
-        .iter()
-        .filter_map(|dir| fs::read_dir(dir).ok())
-        .flat_map(|entries| entries.filter_map(Result::ok).map(|entry| entry.path()))
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| {
-                    name.starts_with("agent-send-daemon-")
-                        && (cfg!(windows) && name.ends_with(".exe")
-                            || !cfg!(windows) && !name.ends_with(".exe"))
-                })
-        })
+    let entries = fs::read_dir(resource_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("agent-send-daemon-")
+                    && (cfg!(windows) && name.ends_with(".exe")
+                        || !cfg!(windows) && !name.ends_with(".exe"))
+            })
+        {
+            return Some(path);
+        }
+        if path.is_dir() {
+            if let Some(path) = daemon_path(&path) {
+                return Some(path);
+            }
+        }
+    }
+    None
 }
 
 fn start_daemon(app: &tauri::AppHandle) {
@@ -68,7 +75,29 @@ fn start_daemon(app: &tauri::AppHandle) {
         eprintln!("agent-send: bundled daemon not found; use the documented development daemon");
         return;
     };
-    match Command::new(&path).args(["--bind", DAEMON_BIND]).spawn() {
+    let data_dir = app.path().app_data_dir().ok();
+    let identity_path = data_dir.as_ref().map(|dir| dir.join("identity.json"));
+    if let Some(dir) = &data_dir {
+        let _ = fs::create_dir_all(dir);
+    }
+    let log = data_dir.as_ref().and_then(|dir| {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("daemon.log"))
+            .ok()
+    });
+    let mut command = Command::new(&path);
+    command.args(["--bind", DAEMON_BIND]);
+    if let Some(identity_path) = &identity_path {
+        command.args(["--identity-path", &identity_path.to_string_lossy()]);
+    }
+    if let Some(log) = log {
+        if let Ok(stderr) = log.try_clone() {
+            command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr));
+        }
+    }
+    match command.spawn() {
         Ok(child) => {
             app.manage(DaemonProcess(Mutex::new(Some(child))));
         }

@@ -54,10 +54,23 @@ fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
     None
 }
 
+fn startup_log(message: impl AsRef<str>) {
+    let path = std::env::temp_dir().join("agent-send-desktop-startup.log");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        use std::io::Write;
+        let _ = writeln!(file, "{}", message.as_ref());
+    }
+}
+
 fn start_daemon(app: &tauri::AppHandle) {
+    startup_log("starting daemon");
     let resource_dir = match app.path().resource_dir() {
-        Ok(path) => path,
+        Ok(path) => {
+            startup_log(format!("resource_dir={}", path.display()));
+            path
+        }
         Err(error) => {
+            startup_log(format!("resource_dir_error={error}"));
             eprintln!("agent-send: cannot locate bundled daemon resources: {error}");
             return;
         }
@@ -72,13 +85,21 @@ fn start_daemon(app: &tauri::AppHandle) {
         )
     });
     let Some(path) = path else {
+        startup_log("daemon_sidecar=not_found");
         eprintln!("agent-send: bundled daemon not found; use the documented development daemon");
         return;
     };
+    startup_log(format!("daemon_sidecar={}", path.display()));
     let data_dir = app.path().app_data_dir().ok();
     let identity_path = data_dir.as_ref().map(|dir| dir.join("identity.json"));
     if let Some(dir) = &data_dir {
-        let _ = fs::create_dir_all(dir);
+        if let Err(error) = fs::create_dir_all(dir) {
+            startup_log(format!("data_dir_error={} error={error}", dir.display()));
+        } else {
+            startup_log(format!("data_dir={}", dir.display()));
+        }
+    } else {
+        startup_log("data_dir=unavailable");
     }
     let log = data_dir.as_ref().and_then(|dir| {
         OpenOptions::new()
@@ -99,9 +120,11 @@ fn start_daemon(app: &tauri::AppHandle) {
     }
     match command.spawn() {
         Ok(child) => {
+            startup_log("daemon_spawn=ok");
             app.manage(DaemonProcess(Mutex::new(Some(child))));
         }
         Err(error) => {
+            startup_log(format!("daemon_spawn_error={error}"));
             eprintln!("agent-send: failed to launch {}: {error}", path.display());
         }
     }

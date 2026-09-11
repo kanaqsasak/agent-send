@@ -38,9 +38,7 @@ fn daemon_path(resource_dir: &Path) -> Option<PathBuf> {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| {
-                name.starts_with("agent-send-daemon-")
-                    && (cfg!(windows) && name.ends_with(".exe")
-                        || !cfg!(windows) && !name.ends_with(".exe"))
+                name.starts_with("agent-send-daemon-") && (cfg!(windows) || !name.ends_with(".exe"))
             })
         {
             return Some(path);

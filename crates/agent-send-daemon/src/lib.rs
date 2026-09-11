@@ -1452,8 +1452,11 @@ fn default_discovery_enabled() -> bool {
 }
 
 fn user_data_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    #[cfg(windows)]
+    let home = std::env::var_os("LOCALAPPDATA").or_else(|| std::env::var_os("USERPROFILE"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME");
+    home.map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".agent-send")
 }

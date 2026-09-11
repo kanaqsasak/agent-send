@@ -242,13 +242,25 @@ async function loadPeers() {
   }
 }
 
+async function healthWithRetry(): Promise<Health> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 12; attempt += 1) {
+    try { return await daemon.health(); }
+    catch (error) {
+      lastError = error;
+      if (attempt < 11) await new Promise((resolve) => window.setTimeout(resolve, 250));
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error("service did not start");
+}
+
 async function checkHealth() {
   if (refreshing) return;
   refreshing = true;
   refreshButton.disabled = true;
   setServiceState("pending", "Checking local service…", "Looking for agent-send on this device");
   try {
-    const health = await daemon.health();
+    const health = await healthWithRetry();
     serviceAvailable = true;
     identity.textContent = health.identity_id;
     setServiceState("online", "Ready to send locally", `Service connected · API v${health.version}`);

@@ -189,7 +189,10 @@ h2 { font-size: 16px; font-weight: 700; }
   background: rgba(0, 0, 0, .38);
 }
 .modal-backdrop[hidden] { display: none; }
-.about-card { width: min(100%, 330px); margin: 0; box-shadow: 0 18px 45px rgba(0, 0, 0, .28); }
+.about-card, .pairing-card { width: min(100%, 370px); margin: 0; box-shadow: 0 18px 45px rgba(0, 0, 0, .28); }
+.pairing-card .pairing-actions { flex-wrap: wrap; }
+.invitation-input { display: block; width: 100%; min-height: 100px; margin-top: 10px; padding: 8px; resize: vertical; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); color: var(--text); font: 11px ui-monospace, Consolas, monospace; }
+.invitation-input::placeholder { color: var(--subtle); }
 .about-heading { display: flex; align-items: flex-start; }
 .about-heading .icon-button { margin-left: auto; }
 .about-card p { margin: 5px 0 10px; color: var(--muted); font-size: 12px; }

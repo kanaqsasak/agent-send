@@ -10,7 +10,7 @@ type Peer = {
   trusted: boolean;
 };
 type PeersResponse = { version: number; peers: Peer[] };
-type PairingResponse = { peer_id: string; code: string; expires_in_seconds: number };
+type PairingResponse = { peer_id: string; code: string; pairing_secret: string; expires_in_seconds: number };
 
 interface DaemonClient {
   endpoint(): Promise<string>;
@@ -18,6 +18,7 @@ interface DaemonClient {
   health(): Promise<Health>;
   peers(): Promise<PeersResponse>;
   requestPairing(peer: Peer["advertisement"]): Promise<PairingResponse>;
+  requestPairingWithMaterial(peer: Peer["advertisement"], code: string, pairingSecret: string): Promise<PairingResponse>;
   confirmPairing(peerId: string, code: string): Promise<void>;
   revoke(peerId: string): Promise<void>;
 }
@@ -46,10 +47,14 @@ const daemon: DaemonClient = {
     const response = await this.request("/v1/pairings", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(peer),
     });
-    // Deliberately retain only the human-verifiable code. Pairing secrets must
-    // never be rendered, logged, or persisted by the desktop client.
-    const { peer_id, code, expires_in_seconds } = await response.json() as PairingResponse & { pairing_secret?: unknown };
-    return { peer_id, code, expires_in_seconds };
+    return await response.json() as PairingResponse;
+  },
+  async requestPairingWithMaterial(peer, code, pairingSecret) {
+    const response = await this.request("/v1/pairings", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...peer, code, pairing_secret: pairingSecret }),
+    });
+    return await response.json() as PairingResponse;
   },
   async confirmPairing(peerId, code) {
     await this.request("/v1/pairings/confirm", {
@@ -89,7 +94,7 @@ app.innerHTML = `
         <div id="peers" class="peers" aria-live="polite"><p class="loading-copy">Looking for devices…</p></div>
       </section>
 
-      <section id="pairing" class="pairing-card" aria-live="polite" hidden></section>
+      <section id="pairing-modal" class="modal-backdrop" role="presentation" hidden><section id="pairing" class="pairing-card" role="dialog" aria-modal="true" aria-labelledby="pairing-heading" aria-live="polite"></section></section>
 
     </main>
 
@@ -112,6 +117,7 @@ const peersElement = document.querySelector<HTMLDivElement>("#peers")!;
 const peerCount = document.querySelector<HTMLSpanElement>("#peer-count")!;
 const errorElement = document.querySelector<HTMLParagraphElement>("#error")!;
 const pairingElement = document.querySelector<HTMLElement>("#pairing")!;
+const pairingModal = document.querySelector<HTMLDivElement>("#pairing-modal")!;
 const aboutModal = document.querySelector<HTMLDivElement>("#about-modal")!;
 const indicator = document.querySelector<HTMLSpanElement>("#service-indicator")!;
 const refreshButton = document.querySelector<HTMLButtonElement>("#refresh")!;
@@ -185,12 +191,37 @@ function renderPeers() {
   }
 }
 
-function hidePairing() { pairingElement.hidden = true; pairingElement.replaceChildren(); }
+function hidePairing() { pairingModal.hidden = true; pairingElement.replaceChildren(); }
+
+async function acceptPairing(peer: Peer) {
+  clearError(); pairingModal.hidden = false;
+  pairingElement.innerHTML = `<div class="section-label">ACCEPT PAIRING</div><h2 id="pairing-heading">Pair with ${deviceName(peer)}</h2><p>Paste the invitation copied from the other device.</p>`;
+  const invitation = document.createElement("textarea");
+  invitation.className = "invitation-input"; invitation.placeholder = '{ "code": "123456", "pairing_secret": "…" }';
+  invitation.setAttribute("aria-label", "Pairing invitation");
+  const actions = document.createElement("div"); actions.className = "pairing-actions";
+  const accept = button("Accept invitation", async () => {
+    try {
+      const parsed = JSON.parse(invitation.value) as { code?: string; pairing_secret?: string };
+      if (!parsed.code || !parsed.pairing_secret) throw new Error("Invitation must include a code and secret.");
+      accept.disabled = true;
+      const result = await daemon.requestPairingWithMaterial(peer.advertisement, parsed.code, parsed.pairing_secret);
+      if (!await confirmRemotePairing(result.peer_id, result.code)) throw new Error("Invitation was rejected.");
+      hidePairing(); await loadPeers();
+    } catch (error) { accept.disabled = false; showError(`Pairing failed: ${error instanceof Error ? error.message : "invalid invitation"}`); }
+  }, "primary-button");
+  actions.append(accept, button("Cancel", hidePairing, "secondary-button"));
+  pairingElement.append(invitation, actions); invitation.focus();
+}
+
+async function confirmRemotePairing(peerId: string, code: string) {
+  await daemon.confirmPairing(peerId, code); return true;
+}
 
 async function startPairing(peer: Peer) {
   if (!serviceAvailable) return;
   clearError();
-  pairingElement.hidden = false;
+  pairingModal.hidden = false;
   pairingElement.textContent = "Creating a secure pairing request…";
   try {
     const result = await daemon.requestPairing(peer.advertisement);
@@ -198,30 +229,23 @@ async function startPairing(peer: Peer) {
     pairingElement.replaceChildren();
     const eyebrow = document.createElement("div"); eyebrow.className = "section-label"; eyebrow.textContent = "PAIR A DEVICE";
     const title = document.createElement("h2"); title.textContent = `Confirm ${name}`;
-    const instruction = document.createElement("p"); instruction.textContent = "Share this code with the other device. Enter the same code below only after that device has confirmed it.";
+    const instruction = document.createElement("p"); instruction.textContent = "Copy the invitation to the other device. It will appear in that device’s Accept pairing dialog.";
     const code = document.createElement("strong"); code.className = "pairing-code"; code.textContent = result.code;
-    const expiry = document.createElement("p"); expiry.className = "expiry"; expiry.textContent = `This code expires in ${Math.ceil(result.expires_in_seconds / 60)} minutes.`;
+    const expiry = document.createElement("p"); expiry.className = "expiry"; expiry.textContent = `This invitation expires in ${Math.ceil(result.expires_in_seconds / 60)} minutes.`;
+    const invitation = JSON.stringify({ code: result.code, pairing_secret: result.pairing_secret });
+    const copy = button("Copy invitation", async () => { await navigator.clipboard.writeText(invitation); copy.textContent = "Invitation copied"; }, "secondary-button");
     const input = document.createElement("input");
     input.inputMode = "numeric"; input.autocomplete = "one-time-code"; input.maxLength = 6; input.pattern = "[0-9]{6}"; input.placeholder = "6-digit code";
     input.setAttribute("aria-label", "Pairing code confirmed on the other device");
     const actions = document.createElement("div"); actions.className = "pairing-actions";
-    const confirm = button("Confirm pairing", async () => {
-      const enteredCode = input.value.trim();
-      if (enteredCode.length !== 6) { input.focus(); showError("Enter the six-digit code shown on the other device."); return; }
+    const confirm = button("I confirmed on the other device", async () => {
       confirm.disabled = true;
-      try { await daemon.confirmPairing(result.peer_id, enteredCode); hidePairing(); await loadPeers(); }
-      catch (error) {
-        confirm.disabled = false;
-        showError(`Pairing failed: ${error instanceof Error ? error.message : "try again"}. Use the six-digit code generated here, after the other device confirms it.`);
-      }
+      try { await daemon.confirmPairing(result.peer_id, result.code); hidePairing(); await loadPeers(); }
+      catch (error) { confirm.disabled = false; showError(`Pairing failed: ${error instanceof Error ? error.message : "try again"}`); }
     }, "primary-button");
-    confirm.disabled = true;
-    const cancel = button("Cancel", hidePairing, "secondary-button");
-    input.addEventListener("input", () => { input.value = input.value.replace(/\D/g, ""); confirm.disabled = input.value.length !== 6; });
-    input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !confirm.disabled) confirm.click(); });
-    actions.append(confirm, cancel);
-    pairingElement.append(eyebrow, title, instruction, code, expiry, input, actions);
-    input.focus();
+    actions.append(copy, confirm, button("Accept invitation", () => acceptPairing(peer), "secondary-button"), button("Cancel", hidePairing, "secondary-button"));
+    pairingElement.append(eyebrow, title, instruction, code, expiry, actions);
+    copy.focus();
   } catch (error) {
     hidePairing();
     showError(`Could not start pairing: ${error instanceof Error ? error.message : "try again"}`);
@@ -320,7 +344,7 @@ document.querySelector("#open-about")?.addEventListener("click", showAbout);
 document.querySelector("#close-about")?.addEventListener("click", hideAbout);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
-    if (!pairingElement.hidden) hidePairing();
+    if (!pairingModal.hidden) hidePairing();
     else if (!aboutModal.hidden) hideAbout();
     else hideWindow();
   }

@@ -41,6 +41,11 @@
       "binaries/agent-send-cli",
       "binaries/agent-send-mcp"
     ],
+    "resources": [
+      "binaries/agent-send-daemon-*",
+      "binaries/agent-send-cli-*",
+      "binaries/agent-send-mcp-*"
+    ],
     "linux": {
       "deb": { "depends": ["libwebkit2gtk-4.1-0", "libayatana-appindicator3-1"] }
     },

@@ -93,7 +93,7 @@ The launcher currently:
 4. Passes an app-data identity path.
 5. Writes startup diagnostics to `%TEMP%\agent-send-desktop-startup.log`.
 
-The Tauri configuration declares both `externalBin` and explicit wildcard `resources` entries for the daemon, CLI, and MCP binaries.
+The Tauri configuration declares both `externalBin` and explicit wildcard `resources` mappings for the daemon, CLI, and MCP binaries. The resource mappings place the staged target-specific files at the resource root so the packaged shell can locate them consistently on Windows.
 
 ## Packaging facts
 
@@ -130,7 +130,7 @@ The packaged installer does not contain the staged daemon sidecar where the desk
 4. Confirm whether `agent-send-daemon-*.exe` exists anywhere under the installed directory.
 5. Inspect the Tauri build output before bundling. Record the exact staged filename and target triple.
 6. Compare the staged filename with Tauri's expected `externalBin` naming convention.
-7. If `externalBin` is unreliable, use Tauri's official sidecar execution API (`tauri-plugin-shell`) or configure explicit resources and launch the exact copied path.
+7. The current fix uses explicit Tauri resource mappings to place the staged target-specific files at the resource root; retain the recursive launcher fallback while verifying the installer. If `externalBin` remains unreliable, use Tauri's official sidecar execution API (`tauri-plugin-shell`) or launch the exact mapped resource path.
 8. Keep the launcher diagnostic log, and add a Windows integration/static packaging check that fails if the daemon resource is absent.
 9. Build a fresh Windows installer and verify:
 

@@ -1342,7 +1342,14 @@ fn agent_error(status: &'static str, code: &str) -> (&'static str, String) {
 fn is_allowed_origin(origin: &str) -> bool {
     matches!(
         origin,
-        "tauri://localhost" | "http://localhost" | "http://127.0.0.1"
+        // Tauri uses tauri://localhost on macOS and tauri.localhost on
+        // Windows/Linux. The explicit Vite origins are only for development.
+        "tauri://localhost"
+            | "http://tauri.localhost"
+            | "http://localhost"
+            | "http://127.0.0.1"
+            | "http://localhost:1420"
+            | "http://127.0.0.1:1420"
     )
 }
 

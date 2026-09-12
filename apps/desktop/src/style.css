@@ -140,6 +140,9 @@ h2 { font-size: 16px; font-weight: 700; }
 .peer-details strong, .peer-details small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .peer-details strong { color: var(--text); font-size: 13px; font-weight: 650; }
 .peer-details small { margin-top: 1px; color: var(--muted); font-size: 11px; }
+.peer-details .peer-meta { color: var(--subtle); font-size: 10px; }
+.peer-row { align-items: flex-start; }
+.peer-row > .primary-button, .peer-row > .secondary-button { align-self: center; }
 .online-dot { display: inline-block; width: 6px; height: 6px; margin: 0 4px 1px 0; border-radius: 50%; background: var(--success); }
 
 .primary-button, .secondary-button, .danger-button {
@@ -176,6 +179,17 @@ h2 { font-size: 16px; font-weight: 700; }
 .pairing-card input::placeholder { color: var(--subtle); letter-spacing: 0; }
 .pairing-actions { display: flex; gap: 7px; margin-top: 9px; }
 
+.modal-backdrop {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  padding: 18px;
+  place-items: center;
+  background: rgba(0, 0, 0, .38);
+}
+.modal-backdrop[hidden] { display: none; }
+.about-card { width: min(100%, 330px); margin: 0; box-shadow: 0 18px 45px rgba(0, 0, 0, .28); }
 .about-heading { display: flex; align-items: flex-start; }
 .about-heading .icon-button { margin-left: auto; }
 .about-card p { margin: 5px 0 10px; color: var(--muted); font-size: 12px; }

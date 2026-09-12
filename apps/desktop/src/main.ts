@@ -91,12 +91,15 @@ app.innerHTML = `
 
       <section id="pairing" class="pairing-card" aria-live="polite" hidden></section>
 
-      <section id="about" class="about-card" aria-labelledby="about-heading" hidden>
+    </main>
+
+    <div id="about-modal" class="modal-backdrop" role="presentation" hidden>
+      <section id="about" class="about-card" role="dialog" aria-modal="true" aria-labelledby="about-heading">
         <div class="about-heading"><div><div class="section-label">ABOUT</div><h2 id="about-heading">agent-send</h2></div><button id="close-about" class="icon-button" type="button" aria-label="Close about">×</button></div>
         <p>Private, local-first file transfer for your trusted devices.</p>
         <dl><div><dt>Version</dt><dd id="about-version">—</dd></div><div><dt>Service</dt><dd id="about-service">Checking…</dd></div></dl>
       </section>
-    </main>
+    </div>
 
     <footer class="footer"><span>Local network only</span><button id="open-about" type="button">agent-send <span id="version">v—</span> · About</button></footer>
   </section>
@@ -109,7 +112,7 @@ const peersElement = document.querySelector<HTMLDivElement>("#peers")!;
 const peerCount = document.querySelector<HTMLSpanElement>("#peer-count")!;
 const errorElement = document.querySelector<HTMLParagraphElement>("#error")!;
 const pairingElement = document.querySelector<HTMLElement>("#pairing")!;
-const aboutElement = document.querySelector<HTMLElement>("#about")!;
+const aboutModal = document.querySelector<HTMLDivElement>("#about-modal")!;
 const indicator = document.querySelector<HTMLSpanElement>("#service-indicator")!;
 const refreshButton = document.querySelector<HTMLButtonElement>("#refresh")!;
 const version = document.querySelector<HTMLSpanElement>("#version")!;
@@ -138,6 +141,9 @@ function button(label: string, action: () => void | Promise<void>, className = "
 }
 function deviceName(peer: Peer) { return peer.advertisement.alias.trim() || "Unnamed device"; }
 function initials(name: string) { return name.trim().slice(0, 1).toUpperCase() || "?"; }
+function peerAddress(peer: Peer) {
+  return peer.advertisement.address.replace(/^https?:\/\//, "").replace(/\/$/, "");
+}
 
 function renderPeers() {
   peersElement.replaceChildren();
@@ -163,8 +169,15 @@ function renderPeers() {
     const title = document.createElement("strong");
     title.textContent = name;
     const state = document.createElement("small");
-    state.innerHTML = peer.trusted ? "<span class=\"online-dot\"></span>Trusted · online" : "Visible on this network · not paired";
-    details.append(title, state);
+    state.innerHTML = peer.trusted ? "<span class=\"online-dot\"></span>Trusted · ready to send" : "Visible on this network · pairing required";
+    const address = document.createElement("small");
+    address.className = "peer-meta";
+    address.textContent = peerAddress(peer);
+    address.title = `Peer ID: ${peer.advertisement.id}`;
+    const protocol = document.createElement("small");
+    protocol.className = "peer-meta";
+    protocol.textContent = `Peer ID ${peer.advertisement.id} · API v${peer.advertisement.api_version}`;
+    details.append(title, state, address, protocol);
     row.append(avatar, details);
     if (peer.trusted) row.append(button("Revoke", () => confirmRevoke(peer), "secondary-button"));
     else row.append(button("Pair", () => startPairing(peer), "primary-button"));
@@ -185,19 +198,22 @@ async function startPairing(peer: Peer) {
     pairingElement.replaceChildren();
     const eyebrow = document.createElement("div"); eyebrow.className = "section-label"; eyebrow.textContent = "PAIR A DEVICE";
     const title = document.createElement("h2"); title.textContent = `Confirm ${name}`;
-    const instruction = document.createElement("p"); instruction.textContent = "Compare this code with the code shown on the other device. Enter it below only when they match.";
+    const instruction = document.createElement("p"); instruction.textContent = "Share this code with the other device. Enter the same code below only after that device has confirmed it.";
     const code = document.createElement("strong"); code.className = "pairing-code"; code.textContent = result.code;
     const expiry = document.createElement("p"); expiry.className = "expiry"; expiry.textContent = `This code expires in ${Math.ceil(result.expires_in_seconds / 60)} minutes.`;
     const input = document.createElement("input");
     input.inputMode = "numeric"; input.autocomplete = "one-time-code"; input.maxLength = 6; input.pattern = "[0-9]{6}"; input.placeholder = "6-digit code";
-    input.setAttribute("aria-label", "Code shown on the other device");
+    input.setAttribute("aria-label", "Pairing code confirmed on the other device");
     const actions = document.createElement("div"); actions.className = "pairing-actions";
     const confirm = button("Confirm pairing", async () => {
       const enteredCode = input.value.trim();
       if (enteredCode.length !== 6) { input.focus(); showError("Enter the six-digit code shown on the other device."); return; }
       confirm.disabled = true;
       try { await daemon.confirmPairing(result.peer_id, enteredCode); hidePairing(); await loadPeers(); }
-      catch (error) { confirm.disabled = false; showError(`Pairing failed: ${error instanceof Error ? error.message : "try again"}`); }
+      catch (error) {
+        confirm.disabled = false;
+        showError(`Pairing failed: ${error instanceof Error ? error.message : "try again"}. Use the six-digit code generated here, after the other device confirms it.`);
+      }
     }, "primary-button");
     confirm.disabled = true;
     const cancel = button("Cancel", hidePairing, "secondary-button");
@@ -281,8 +297,17 @@ async function checkHealth() {
   }
 }
 
-function showAbout() { aboutElement.hidden = false; document.querySelector<HTMLButtonElement>("#close-about")?.focus(); }
-function hideAbout() { aboutElement.hidden = true; document.querySelector<HTMLButtonElement>("#open-about")?.focus(); }
+function showAbout() {
+  aboutModal.hidden = false;
+  document.querySelector<HTMLButtonElement>("#close-about")?.focus();
+}
+function hideAbout() {
+  aboutModal.hidden = true;
+  document.querySelector<HTMLButtonElement>("#open-about")?.focus();
+}
+aboutModal.addEventListener("click", (event) => {
+  if (event.target === aboutModal) hideAbout();
+});
 function hideWindow() { void nativeWindow.hide().catch(() => window.close()); }
 
 void invoke<string>("app_version").then((value) => {
@@ -296,7 +321,7 @@ document.querySelector("#close-about")?.addEventListener("click", hideAbout);
 document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") {
     if (!pairingElement.hidden) hidePairing();
-    else if (!aboutElement.hidden) hideAbout();
+    else if (!aboutModal.hidden) hideAbout();
     else hideWindow();
   }
   if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "r") { event.preventDefault(); void checkHealth(); }
